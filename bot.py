@@ -13,10 +13,9 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import (
     GetChatInviteImportersRequest,
-    InputUserEmpty,
     HideAllChatJoinRequestsRequest,
-    HideChatJoinRequestRequest,
 )
+from telethon.tl.types import InputUserEmpty
 from telethon.errors import (
     ApiIdInvalidError,
     FloodWaitError,
