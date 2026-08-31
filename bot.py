@@ -2162,7 +2162,7 @@ async def dashboard_screen(actor: Actor) -> tuple[str, InlineKeyboardMarkup]:
     return text, keyboard(rows)
 
 
-@router.message(Command("admin"))
+@admin_dashboard_router.message(Command("admin"))
 @requires("dashboard")
 async def cmd_admin(message: Message, actor: Actor, **_) -> None:
     text, markup = await dashboard_screen(actor)
@@ -2170,14 +2170,14 @@ async def cmd_admin(message: Message, actor: Actor, **_) -> None:
     await audit(actor, "Opened dashboard")
 
 
-@router.callback_query(F.data.startswith("a:dash:"))
+@admin_dashboard_router.callback_query(F.data.startswith("a:dash:"))
 @requires("dashboard")
 async def cb_dashboard(call: CallbackQuery, actor: Actor, **_) -> None:
     text, markup = await dashboard_screen(actor)
     await show(call, text, markup, alert="🔄 Refreshed")
 
 
-@router.callback_query(F.data.startswith("a:noop:"))
+@admin_dashboard_router.callback_query(F.data.startswith("a:noop:"))
 async def cb_noop(call: CallbackQuery) -> None:
     await call.answer()
 
@@ -2186,7 +2186,7 @@ async def cb_noop(call: CallbackQuery) -> None:
 # analytics
 # --------------------------------------------------------------------------
 
-@router.callback_query(F.data.startswith("a:stats:"))
+@admin_dashboard_router.callback_query(F.data.startswith("a:stats:"))
 @requires("analytics")
 async def cb_stats(call: CallbackQuery, actor: Actor, **_) -> None:
     _, _, args = parse_cb(call.data)
@@ -2241,7 +2241,7 @@ async def cb_stats(call: CallbackQuery, actor: Actor, **_) -> None:
 # system health
 # --------------------------------------------------------------------------
 
-@router.callback_query(F.data.startswith("a:hp:"))
+@admin_dashboard_router.callback_query(F.data.startswith("a:hp:"))
 @requires("dashboard")
 async def cb_health(call: CallbackQuery, bot: Bot, actor: Actor, **_) -> None:
     data = await health.probe(bot)
@@ -2279,7 +2279,7 @@ async def cb_health(call: CallbackQuery, bot: Bot, actor: Actor, **_) -> None:
 # bot controls
 # --------------------------------------------------------------------------
 
-@router.callback_query(F.data.startswith("a:ctl:"))
+@admin_dashboard_router.callback_query(F.data.startswith("a:ctl:"))
 @requires("settings")
 async def cb_controls(call: CallbackQuery, actor: Actor, **_) -> None:
     _, action, args = parse_cb(call.data)
@@ -2422,7 +2422,7 @@ async def user_card(tg_id: int) -> tuple[str, object] | None:
     return screen("👤 USER DETAILS", lines), keyboard(kb)
 
 
-@router.callback_query(F.data.startswith("a:users:"))
+@admin_users_router.callback_query(F.data.startswith("a:users:"))
 @requires("users")
 async def cb_users(call: CallbackQuery, state: FSMContext, actor: Actor, **_) -> None:
     _, action, args = parse_cb(call.data)
@@ -2509,7 +2509,7 @@ async def cb_users(call: CallbackQuery, state: FSMContext, actor: Actor, **_) ->
                    keyboard([nav_row(back=cb("users", "view", tg_id))]))
 
 
-@router.message(Wizard.user_search)
+@admin_users_router.message(Wizard.user_search)
 @requires("users")
 async def do_search(message: Message, state: FSMContext, actor: Actor, **_) -> None:
     await state.clear()
@@ -2529,7 +2529,7 @@ async def do_search(message: Message, state: FSMContext, actor: Actor, **_) -> N
     await show(message, screen("🔍 SEARCH RESULT", lines), keyboard(kb))
 
 
-@router.message(Wizard.user_message)
+@admin_users_router.message(Wizard.user_message)
 @requires("users")
 async def do_direct_message(message: Message, state: FSMContext, bot: Bot,
                             actor: Actor, **_) -> None:
@@ -2592,7 +2592,7 @@ async def admin_card(tg_id: int) -> tuple[str, object] | None:
     return screen("👑 ADMIN DETAILS", lines), keyboard(kb)
 
 
-@router.callback_query(F.data.startswith("a:adm:"))
+@admin_users_router.callback_query(F.data.startswith("a:adm:"))
 @requires("admins")
 async def cb_admins(call: CallbackQuery, state: FSMContext, actor: Actor, **_) -> None:
     _, action, args = parse_cb(call.data)
@@ -2652,7 +2652,7 @@ async def cb_admins(call: CallbackQuery, state: FSMContext, actor: Actor, **_) -
         await show(call, *(await admins_screen()), alert="🗑 Removed")
 
 
-@router.message(Wizard.admin_add)
+@admin_users_router.message(Wizard.admin_add)
 @requires("admins")
 async def do_add_admin(message: Message, state: FSMContext, actor: Actor, **_) -> None:
     await state.clear()
@@ -2670,7 +2670,7 @@ async def do_add_admin(message: Message, state: FSMContext, actor: Actor, **_) -
 # referral manager
 # --------------------------------------------------------------------------
 
-@router.callback_query(F.data.startswith("a:ref:"))
+@admin_users_router.callback_query(F.data.startswith("a:ref:"))
 @requires("referrals")
 async def cb_referrals(call: CallbackQuery, bot: Bot, actor: Actor, **_) -> None:
     _, action, args = parse_cb(call.data)
@@ -2786,7 +2786,7 @@ async def channel_card(cid: int) -> tuple[str, object] | None:
     return screen("📢 CHANNEL", lines), keyboard(kb)
 
 
-@router.callback_query(F.data.startswith("a:chan:"))
+@admin_content_router.callback_query(F.data.startswith("a:chan:"))
 @requires("channels")
 async def cb_channels(call: CallbackQuery, state: FSMContext, bot: Bot,
                       actor: Actor, **_) -> None:
@@ -2878,7 +2878,7 @@ async def cb_channels(call: CallbackQuery, state: FSMContext, bot: Bot,
         await show(call, *(await channels_screen()), alert="🗑 Deleted")
 
 
-@router.message(Wizard.channel_chat_id)
+@admin_content_router.message(Wizard.channel_chat_id)
 @requires("channels")
 async def do_add_channel(message: Message, state: FSMContext, bot: Bot,
                          actor: Actor, **_) -> None:
@@ -2902,7 +2902,7 @@ async def do_add_channel(message: Message, state: FSMContext, bot: Bot,
     await show(message, *(await channel_card(cid)))
 
 
-@router.message(Wizard.channel_title)
+@admin_content_router.message(Wizard.channel_title)
 @requires("channels")
 async def do_edit_title(message: Message, state: FSMContext, actor: Actor, **_) -> None:
     data = await state.get_data()
@@ -2913,7 +2913,7 @@ async def do_edit_title(message: Message, state: FSMContext, actor: Actor, **_) 
     await show(message, *(await channel_card(cid)))
 
 
-@router.message(Wizard.channel_link)
+@admin_content_router.message(Wizard.channel_link)
 @requires("channels")
 async def do_edit_link(message: Message, state: FSMContext, actor: Actor, **_) -> None:
     data = await state.get_data()
@@ -2928,7 +2928,7 @@ async def do_edit_link(message: Message, state: FSMContext, actor: Actor, **_) -
 # message CMS
 # --------------------------------------------------------------------------
 
-@router.callback_query(F.data.startswith("a:msg:"))
+@admin_content_router.callback_query(F.data.startswith("a:msg:"))
 @requires("messages")
 async def cb_messages(call: CallbackQuery, state: FSMContext, actor: Actor,
                       **_) -> None:
@@ -3029,7 +3029,7 @@ async def cb_messages(call: CallbackQuery, state: FSMContext, actor: Actor,
     await show(call, screen("✏️ MESSAGE", lines), keyboard(kb))
 
 
-@router.message(Wizard.message_edit)
+@admin_content_router.message(Wizard.message_edit)
 @requires("messages")
 async def do_edit_message(message: Message, state: FSMContext, actor: Actor,
                           **_) -> None:
@@ -3050,7 +3050,7 @@ async def do_edit_message(message: Message, state: FSMContext, actor: Actor,
 # visual button builder
 # --------------------------------------------------------------------------
 
-@router.callback_query(F.data.startswith("a:btn:"))
+@admin_content_router.callback_query(F.data.startswith("a:btn:"))
 @requires("buttons")
 async def cb_buttons(call: CallbackQuery, state: FSMContext, actor: Actor,
                      **_) -> None:
@@ -3191,7 +3191,7 @@ async def cb_buttons(call: CallbackQuery, state: FSMContext, actor: Actor,
     await show(call, screen("🔘 BUTTON", lines), keyboard(kb))
 
 
-@router.message(Wizard.button_text)
+@admin_content_router.message(Wizard.button_text)
 @requires("buttons")
 async def do_button_text(message: Message, state: FSMContext, actor: Actor,
                          **_) -> None:
@@ -3229,7 +3229,7 @@ async def do_button_text(message: Message, state: FSMContext, actor: Actor,
     ]), keyboard([cancel_row(cb("btn", "view", bid))]))
 
 
-@router.message(Wizard.button_target)
+@admin_content_router.message(Wizard.button_target)
 @requires("buttons")
 async def do_button_target(message: Message, state: FSMContext, actor: Actor,
                            **_) -> None:
@@ -3334,7 +3334,7 @@ async def draft_screen(bid: int) -> tuple[str, object] | None:
     return screen("📢 BROADCAST COMPOSER", lines), keyboard(kb)
 
 
-@router.callback_query(F.data.startswith("a:bc:"))
+@admin_broadcast_router.callback_query(F.data.startswith("a:bc:"))
 @requires("broadcast")
 async def cb_broadcast(call: CallbackQuery, state: FSMContext, bot: Bot,
                        actor: Actor, **_) -> None:
@@ -3539,7 +3539,7 @@ async def cb_broadcast(call: CallbackQuery, state: FSMContext, bot: Bot,
         await show(call, *(await studio_screen()), alert="🗑 Deleted")
 
 
-@router.message(Wizard.broadcast_content)
+@admin_broadcast_router.message(Wizard.broadcast_content)
 @requires("broadcast")
 async def do_broadcast_content(message: Message, state: FSMContext,
                                actor: Actor, **_) -> None:
@@ -3578,7 +3578,7 @@ async def do_broadcast_content(message: Message, state: FSMContext,
     await show(message, *(await draft_screen(bid)))
 
 
-@router.message(Wizard.broadcast_buttons)
+@admin_broadcast_router.message(Wizard.broadcast_buttons)
 @requires("broadcast")
 async def do_broadcast_buttons(message: Message, state: FSMContext,
                                actor: Actor, **_) -> None:
@@ -3591,7 +3591,7 @@ async def do_broadcast_buttons(message: Message, state: FSMContext,
     await show(message, *(await draft_screen(bid)))
 
 
-@router.message(Wizard.broadcast_custom_ids)
+@admin_broadcast_router.message(Wizard.broadcast_custom_ids)
 @requires("broadcast")
 async def do_broadcast_ids(message: Message, state: FSMContext, actor: Actor,
                            **_) -> None:
@@ -3602,7 +3602,7 @@ async def do_broadcast_ids(message: Message, state: FSMContext, actor: Actor,
     await show(message, *(await draft_screen(bid)))
 
 
-@router.message(Wizard.broadcast_schedule)
+@admin_broadcast_router.message(Wizard.broadcast_schedule)
 @requires("broadcast")
 async def do_broadcast_schedule(message: Message, state: FSMContext, actor: Actor,
                                 **_) -> None:
@@ -3636,7 +3636,7 @@ async def do_broadcast_schedule(message: Message, state: FSMContext, actor: Acto
 CAMPAIGN_ICON = {"ACTIVE": "🟢", "PAUSED": "⏸", "ENDED": "🔴"}
 
 
-@router.callback_query(F.data.startswith("a:camp:"))
+@admin_broadcast_router.callback_query(F.data.startswith("a:camp:"))
 @requires("campaigns")
 async def cb_campaigns(call: CallbackQuery, state: FSMContext, actor: Actor,
                        **_) -> None:
@@ -3736,7 +3736,7 @@ async def cb_campaigns(call: CallbackQuery, state: FSMContext, actor: Actor,
     await show(call, screen("🎯 CAMPAIGN", lines), keyboard(kb))
 
 
-@router.message(Wizard.campaign_name)
+@admin_broadcast_router.message(Wizard.campaign_name)
 @requires("campaigns")
 async def do_campaign_name(message: Message, state: FSMContext, actor: Actor,
                            **_) -> None:
@@ -3750,7 +3750,7 @@ async def do_campaign_name(message: Message, state: FSMContext, actor: Actor,
     ]), keyboard([cancel_row(cb("camp", "view", cid))]))
 
 
-@router.message(Wizard.campaign_body)
+@admin_broadcast_router.message(Wizard.campaign_body)
 @requires("campaigns")
 async def do_campaign_body(message: Message, state: FSMContext, actor: Actor,
                            **_) -> None:
@@ -3762,7 +3762,7 @@ async def do_campaign_body(message: Message, state: FSMContext, actor: Actor,
                keyboard([nav_row(back=cb("camp", "view", cid))]))
 
 
-@router.message(Wizard.campaign_dates)
+@admin_broadcast_router.message(Wizard.campaign_dates)
 @requires("campaigns")
 async def do_campaign_dates(message: Message, state: FSMContext, actor: Actor,
                             **_) -> None:
@@ -3784,7 +3784,7 @@ async def do_campaign_dates(message: Message, state: FSMContext, actor: Actor,
 JOB_ICON = {"SCHEDULED": "🟢", "PAUSED": "⏸", "DONE": "✅", "CANCELLED": "🚫"}
 
 
-@router.callback_query(F.data.startswith("a:sch:"))
+@admin_broadcast_router.callback_query(F.data.startswith("a:sch:"))
 @requires("broadcast")
 async def cb_scheduler(call: CallbackQuery, actor: Actor, **_) -> None:
     _, action, args = parse_cb(call.data)
@@ -3846,7 +3846,7 @@ PER_PAGE = 10
 # settings
 # --------------------------------------------------------------------------
 
-@router.callback_query(F.data.startswith("a:set:"))
+@admin_system_router.callback_query(F.data.startswith("a:set:"))
 @requires("settings")
 async def cb_settings(call: CallbackQuery, state: FSMContext, actor: Actor,
                       **_) -> None:
@@ -3912,7 +3912,7 @@ async def cb_settings(call: CallbackQuery, state: FSMContext, actor: Actor,
         ]), keyboard([cancel_row(cb("set", "sec", row["section"]))]))
 
 
-@router.message(Wizard.setting_value)
+@admin_system_router.message(Wizard.setting_value)
 @requires("settings")
 async def do_setting(message: Message, state: FSMContext, actor: Actor, **_) -> None:
     data = await state.get_data()
@@ -3932,7 +3932,7 @@ async def do_setting(message: Message, state: FSMContext, actor: Actor, **_) -> 
 # database manager
 # --------------------------------------------------------------------------
 
-@router.callback_query(F.data.startswith("a:dbm:"))
+@admin_system_router.callback_query(F.data.startswith("a:dbm:"))
 @requires("database")
 async def cb_database(call: CallbackQuery, state: FSMContext, actor: Actor,
                       **_) -> None:
@@ -4006,7 +4006,7 @@ async def cb_database(call: CallbackQuery, state: FSMContext, actor: Actor,
     await show(call, screen("💾 DATABASE MANAGER", lines), keyboard(kb), note)
 
 
-@router.message(F.document)
+@admin_system_router.message(F.document)
 @requires("database")
 async def do_restore(message: Message, state: FSMContext, bot: Bot, actor: Actor,
                      **_) -> None:
@@ -4031,7 +4031,7 @@ async def do_restore(message: Message, state: FSMContext, bot: Bot, actor: Actor
 # audit logs
 # --------------------------------------------------------------------------
 
-@router.callback_query(F.data.startswith("a:log:"))
+@admin_system_router.callback_query(F.data.startswith("a:log:"))
 @requires("logs")
 async def cb_logs(call: CallbackQuery, actor: Actor, **_) -> None:
     _, action, args = parse_cb(call.data)
@@ -4073,7 +4073,7 @@ async def cb_logs(call: CallbackQuery, actor: Actor, **_) -> None:
 # error center
 # --------------------------------------------------------------------------
 
-@router.callback_query(F.data.startswith("a:err:"))
+@admin_system_router.callback_query(F.data.startswith("a:err:"))
 @requires("logs")
 async def cb_errors(call: CallbackQuery, actor: Actor, **_) -> None:
     _, action, args = parse_cb(call.data)
@@ -4135,7 +4135,7 @@ async def cb_errors(call: CallbackQuery, actor: Actor, **_) -> None:
 # wizard safety net - never leave an admin stuck inside a conversation
 # --------------------------------------------------------------------------
 
-@router.callback_query(F.data.startswith("a:wizard:cancel"))
+@admin_system_router.callback_query(F.data.startswith("a:wizard:cancel"))
 async def cb_cancel(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     state_clock.clear(call.from_user.id)
@@ -4221,7 +4221,7 @@ async def _send_claim(message: Message) -> None:
                              reply_markup=await build_keyboard("claim"))
 
 
-@router.message(CommandStart())
+@user_flow_router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot) -> None:
     user = message.from_user
     if user is None:
@@ -4267,7 +4267,7 @@ async def _followup(bot: Bot, tg_id: int) -> None:
         await capture("FOLLOWUP", exc, f"follow-up to {tg_id}")
 
 
-@router.callback_query(F.data == "flow:verify")
+@user_flow_router.callback_query(F.data == "flow:verify")
 async def cb_verify(call: CallbackQuery, bot: Bot) -> None:
     tg_id = call.from_user.id
     await Users.touch(tg_id, call.from_user.username, call.from_user.first_name,
@@ -4291,7 +4291,7 @@ async def cb_verify(call: CallbackQuery, bot: Bot) -> None:
         await call.message.edit_reply_markup(reply_markup=await join_keyboard(missing))
 
 
-@router.callback_query(F.data.in_({"flow:claim", "flow:claim_confirm"}))
+@user_flow_router.callback_query(F.data.in_({"flow:claim", "flow:claim_confirm"}))
 async def cb_claim(call: CallbackQuery, bot: Bot) -> None:
     tg_id = call.from_user.id
     await Events.log(tg_id, "claim_click")
@@ -4334,7 +4334,7 @@ async def cb_claim(call: CallbackQuery, bot: Bot) -> None:
     await call.answer("✅ Claimed")
 
 
-@router.callback_query(F.data == "flow:referral")
+@user_flow_router.callback_query(F.data == "flow:referral")
 async def cb_referral(call: CallbackQuery, bot: Bot) -> None:
     if not await settings.flag("referral_enabled", True):
         await call.answer("Referrals are currently disabled.", show_alert=True)
@@ -4354,7 +4354,7 @@ async def cb_referral(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
 
 
-@router.callback_query(F.data == "flow:help")
+@user_flow_router.callback_query(F.data == "flow:help")
 async def cb_help(call: CallbackQuery) -> None:
     rendered = await render("help")
     if rendered:
@@ -4362,21 +4362,21 @@ async def cb_help(call: CallbackQuery) -> None:
     await call.answer()
 
 
-@router.message(Command("help"))
+@user_flow_router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     rendered = await render("help")
     if rendered:
         await message.answer(rendered[0], parse_mode=rendered[1])
 
 
-@router.message(Command("about"))
+@user_flow_router.message(Command("about"))
 async def cmd_about(message: Message) -> None:
     rendered = await render("about")
     if rendered:
         await message.answer(rendered[0], parse_mode=rendered[1])
 
 
-@router.message(F.chat.type == "private")
+@user_flow_router.message(F.chat.type == "private")
 async def track_activity(message: Message) -> None:
     """Keeps last-seen fresh so 'active users' means something real."""
     user = message.from_user
