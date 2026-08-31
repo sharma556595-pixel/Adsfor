@@ -1,960 +1,1312 @@
 import asyncio
-import json
 import logging
 import os
-import secrets
 import sqlite3
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.tl.functions.messages import (
-    GetChatInviteImportersRequest,
-    HideAllChatJoinRequestsRequest,
+from telegram import (
+    Bot,
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
 )
-from telethon.tl.types import InputUserEmpty
-from telethon.errors import (
-    ApiIdInvalidError,
-    FloodWaitError,
-    PasswordHashInvalidError,
-    PhoneCodeExpiredError,
-    PhoneCodeInvalidError,
-    PhoneNumberInvalidError,
-    SessionPasswordNeededError,
-    UserAlreadyParticipantError,
-)
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatMemberStatus
-from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CallbackQueryHandler,
     ChatJoinRequestHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "8753914631"))
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///member_acceptor.db").strip()
-DB_PATH = Path(DATABASE_URL.replace("sqlite:///", "", 1))
-PORT = int(os.getenv("PORT", "10000"))
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "telegram-webhook").strip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-POLL_SECONDS = max(10, int(os.getenv("POLL_SECONDS", "30")))
-MAX_LOGIN_WAIT = 300
+OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot_data.db").strip()
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-if not OWNER_ID:
-    raise RuntimeError("OWNER_ID must be a numeric Telegram user ID")
+    raise RuntimeError("BOT_TOKEN is missing.")
+
+try:
+    OWNER_ID = int(OWNER_ID_RAW)
+except (TypeError, ValueError):
+    raise RuntimeError("OWNER_ID must be a numeric Telegram user ID.")
+
+if DATABASE_URL.startswith("sqlite:///"):
+    DB_PATH = Path(DATABASE_URL[len("sqlite:///"):])
+elif DATABASE_URL.startswith("sqlite://"):
+    DB_PATH = Path(DATABASE_URL[len("sqlite://"):])
+else:
+    raise RuntimeError("This build supports SQLite only. Set DATABASE_URL=sqlite:///bot_data.db")
 
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-log = logging.getLogger("member_acceptor")
+
+BROADCAST_DELAY = 0.08
+FETCH_BATCH_SIZE = 200          # max join requests pulled per Fetch action
+ACCEPT_DECLINE_DELAY = 0.05     # throttle between per-user accept/decline calls
+MAX_TEXT_LENGTH = 4096
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger("member_acceptor_bot")
 
 
-def now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-class DB:
+def safe_int(value, default=0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def clean_error(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"[:500]
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+class Database:
+    """Thin synchronous SQLite wrapper. Every write commits immediately --
+    this bot's write volume never justifies batching, and immediate commits
+    mean a crash mid-request loses at most one row, not a whole batch."""
+
     def __init__(self, path: Path):
-        self.conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA busy_timeout=30000")
-        self.init()
+        self.path = path
+        self._conn: Optional[sqlite3.Connection] = None
 
-    def init(self):
-        self.conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            last_seen TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'user',
-            blocked INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS telegram_sessions (
-            user_id INTEGER PRIMARY KEY,
-            api_id INTEGER NOT NULL,
-            api_hash TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            session TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS channels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_id INTEGER NOT NULL,
-            channel_id INTEGER NOT NULL,
-            username TEXT,
-            title TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(owner_id, channel_id)
-        );
-        CREATE TABLE IF NOT EXISTS settings (
-            owner_id INTEGER NOT NULL,
-            key TEXT NOT NULL,
-            value TEXT NOT NULL,
-            PRIMARY KEY(owner_id, key)
-        );
-        CREATE TABLE IF NOT EXISTS request_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_id INTEGER NOT NULL,
-            channel_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS pending_request_contacts (
-            owner_id INTEGER NOT NULL,
-            channel_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            user_chat_id INTEGER,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY(owner_id, channel_id, user_id)
-        );
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_id INTEGER,
-            kind TEXT NOT NULL,
-            details TEXT,
-            created_at TEXT NOT NULL
-        );
-        """)
-        self.conn.execute("INSERT OR IGNORE INTO users(user_id,last_seen,role) VALUES(?,?,?)", (OWNER_ID, now(), "owner"))
-        self.conn.commit()
+    def connect(self):
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._create_schema()
 
-    def execute(self, q, p=(), commit=True):
-        cur = self.conn.execute(q, p)
+    def close(self):
+        if self._conn:
+            self._conn.close()
+
+    def execute(self, query: str, params=(), commit: bool = False):
+        cur = self._conn.execute(query, params)
         if commit:
-            self.conn.commit()
+            self._conn.commit()
         return cur
 
-    def one(self, q, p=()):
-        return self.execute(q, p, False).fetchone()
+    def executemany(self, query: str, seq_of_params, commit: bool = True):
+        cur = self._conn.executemany(query, seq_of_params)
+        if commit:
+            self._conn.commit()
+        return cur
 
-    def all(self, q, p=()):
-        return self.execute(q, p, False).fetchall()
+    def fetchone(self, query: str, params=()):
+        return self._conn.execute(query, params).fetchone()
 
-    def user(self, u):
-        self.execute("""INSERT INTO users(user_id,username,first_name,last_seen) VALUES(?,?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name,last_seen=excluded.last_seen""",
-        (u.id, u.username, u.first_name, now()))
+    def fetchall(self, query: str, params=()):
+        return self._conn.execute(query, params).fetchall()
 
-    def setting(self, uid, key, default=""):
-        r = self.one("SELECT value FROM settings WHERE owner_id=? AND key=?", (uid, key))
-        return r["value"] if r else default
+    def _create_schema(self):
+        c = self._conn
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
 
-    def set_setting(self, uid, key, value):
-        self.execute("INSERT INTO settings(owner_id,key,value) VALUES(?,?,?) ON CONFLICT(owner_id,key) DO UPDATE SET value=excluded.value", (uid,key,str(value)))
+            CREATE TABLE IF NOT EXISTS owner_login (
+                id            INTEGER PRIMARY KEY CHECK (id = 1),
+                api_id        TEXT,
+                api_hash      TEXT,
+                phone_number  TEXT,
+                verified      INTEGER DEFAULT 0,
+                verified_at   TEXT
+            );
 
-    def log(self, owner_id, kind, details=""):
-        self.execute("INSERT INTO events(owner_id,kind,details,created_at) VALUES(?,?,?,?)", (owner_id,kind,str(details)[:4000],now()))
+            CREATE TABLE IF NOT EXISTS channels (
+                chat_id           INTEGER PRIMARY KEY,
+                title             TEXT,
+                username          TEXT,
+                added_by          INTEGER,
+                added_at          TEXT,
+                active            INTEGER DEFAULT 1,
+                total_accepted    INTEGER DEFAULT 0,
+                total_declined    INTEGER DEFAULT 0,
+                auto_accept       INTEGER DEFAULT 0,
+                require_username  INTEGER DEFAULT 0,
+                min_account_age_days INTEGER DEFAULT 0,
+                welcome_enabled   INTEGER DEFAULT 1
+            );
 
-    def session(self, uid):
-        return self.one("SELECT * FROM telegram_sessions WHERE user_id=?", (uid,))
+            CREATE TABLE IF NOT EXISTS join_requests (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id      INTEGER NOT NULL,
+                user_id      INTEGER NOT NULL,
+                username     TEXT,
+                full_name    TEXT,
+                requested_at TEXT,
+                status       TEXT DEFAULT 'pending',
+                resolved_at  TEXT,
+                resolved_by  INTEGER,
+                UNIQUE(chat_id, user_id, status) ON CONFLICT REPLACE
+            );
 
-    def save_session(self, uid, api_id, api_hash, phone, session):
-        self.execute("""INSERT INTO telegram_sessions(user_id,api_id,api_hash,phone,session,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET api_id=excluded.api_id,api_hash=excluded.api_hash,phone=excluded.phone,session=excluded.session,updated_at=excluded.updated_at""",
-        (uid,api_id,api_hash,phone,session,now(),now()))
+            CREATE INDEX IF NOT EXISTS idx_jr_chat_status
+                ON join_requests(chat_id, status);
 
-    def delete_session(self, uid):
-        self.execute("DELETE FROM telegram_sessions WHERE user_id=?", (uid,))
+            CREATE TABLE IF NOT EXISTS channel_admins (
+                chat_id  INTEGER NOT NULL,
+                user_id  INTEGER NOT NULL,
+                added_at TEXT,
+                PRIMARY KEY (chat_id, user_id)
+            );
 
-    def add_channel(self, owner, channel_id, username, title):
-        self.execute("""INSERT INTO channels(owner_id,channel_id,username,title,created_at,updated_at)
-        VALUES(?,?,?,?,?,?) ON CONFLICT(owner_id,channel_id) DO UPDATE SET username=excluded.username,title=excluded.title,enabled=1,updated_at=excluded.updated_at""",
-        (owner,channel_id,username,title,now(),now()))
+            CREATE TABLE IF NOT EXISTS users_seen (
+                user_id    INTEGER PRIMARY KEY,
+                username   TEXT,
+                full_name  TEXT,
+                first_seen TEXT,
+                last_seen  TEXT,
+                banned     INTEGER DEFAULT 0
+            );
 
-    def channels(self, owner):
-        return self.all("SELECT * FROM channels WHERE owner_id=? AND enabled=1 ORDER BY title", (owner,))
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id   INTEGER,
+                actor_id  INTEGER,
+                action    TEXT,
+                detail    TEXT,
+                at        TEXT
+            );
 
-    def channel(self, owner, cid):
-        return self.one("SELECT * FROM channels WHERE owner_id=? AND channel_id=?", (owner,cid))
+            CREATE TABLE IF NOT EXISTS pending_input (
+                user_id INTEGER PRIMARY KEY,
+                mode    TEXT,
+                payload TEXT,
+                set_at  TEXT
+            );
+            """
+        )
+        c.execute(
+            "INSERT OR IGNORE INTO owner_login (id, verified) VALUES (1, 0)"
+        )
+        c.commit()
 
-    def remove_channel(self, owner, cid):
-        self.execute("DELETE FROM channels WHERE owner_id=? AND channel_id=?", (owner,cid))
+    # ---- settings ----
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        row = self.fetchone("SELECT value FROM bot_settings WHERE key=?", (key,))
+        return row["value"] if row else default
 
-    def log_request(self, owner, cid, uid, action):
-        self.execute("INSERT INTO request_log(owner_id,channel_id,user_id,action,created_at) VALUES(?,?,?,?,?)", (owner,cid,uid,action,now()))
+    def set_setting(self, key: str, value: str):
+        self.execute(
+            "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+            commit=True,
+        )
 
-    def owner_count(self):
-        return self.one("SELECT COUNT(*) c FROM users WHERE role='user'")["c"]
-
-
-db = DB(DB_PATH)
-
-# One Telethon client per bot user. A client is built only after the user has
-# explicitly supplied their own API credentials and completed Telegram login.
-clients: dict[int, TelegramClient] = {}
-login_flows: dict[int, dict] = {}
-
-
-def is_owner(uid: int) -> bool:
-    return uid == OWNER_ID
-
-
-def is_user(uid: int) -> bool:
-    return bool(db.one("SELECT user_id FROM users WHERE user_id=?", (uid,)))
-
-
-def btn(text, data=None, url=None):
-    return InlineKeyboardButton(text, callback_data=data, url=url)
-
-
-def back():
-    return InlineKeyboardMarkup([[btn("⬅️ Back", "home")]])
-
-
-def user_home_kb():
-    return InlineKeyboardMarkup([
-        [btn("📊 My Dashboard", "dashboard")],
-        [btn("🔐 Telegram Login", "login"), btn("🚪 Logout", "logout")],
-        [btn("📢 My Channels", "channels")],
-        [btn("📩 Fetch Requests", "fetch")],
-        [btn("👥 Approve All", "approve_all"), btn("🚫 Decline All", "decline_all")],
-        [btn("⚙️ Settings", "settings")],
-    ])
-
-
-def owner_kb():
-    return InlineKeyboardMarkup([
-        [btn("📊 Dashboard", "dashboard"), btn("👤 Users", "owner_users")],
-        [btn("📢 Channels", "owner_channels"), btn("📩 Requests", "owner_requests")],
-        [btn("📣 Broadcast", "owner_broadcast"), btn("💬 Accepted Msg", "set_message")],
-        [btn("📝 Preview Msg", "preview_message"), btn("📈 Statistics", "owner_stats")],
-        [btn("🧾 Logs", "owner_logs"), btn("🔐 Sessions", "owner_sessions")],
-        [btn("🔎 User Search", "owner_user_search"), btn("🔎 Channel Search", "owner_channel_search")],
-        [btn("📋 Request Audit", "owner_request_audit"), btn("📤 Export Users", "owner_export_users")],
-        [btn("📤 Export Channels", "owner_export_channels"), btn("📤 Export Logs", "owner_export_logs")],
-        [btn("🛡 Security", "owner_security"), btn("⚙️ Permissions", "owner_permissions")],
-        [btn("🤖 Bot Info", "owner_bot_info"), btn("🌐 Runtime", "owner_runtime")],
-        [btn("💾 Backup", "owner_backup"), btn("🧹 Maintenance", "owner_maintenance")],
-        [btn("🗑 Clear Logs", "owner_clear_logs"), btn("🔄 Sync Channels", "owner_sync")],
-        [btn("⏱ Rate Limits", "owner_rate_limits"), btn("📦 Database", "owner_database")],
-        [btn("🧪 Health Check", "owner_health"), btn("❓ Help", "owner_help")],
-        [btn("🔄 Refresh", "dashboard")],
-    ])
-
-
-def owner_only_message():
-    return "🔒 This section is Owner-only."
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if not u or not update.message:
-        return
-    db.user(u)
-    text = (
-        "🛡 MEMBER ACCEPTOR BOT\n\n"
-        "Manage Telegram channel join requests from one clean panel.\n\n"
-        "👤 User: Login with your own Telegram API ID/API Hash + phone.\n"
-        "📢 Channel: Add your channel after giving the bot admin rights.\n"
-        "📩 Requests: Fetch pending count and process requests.\n\n"
-        "⚠️ Never send your Telegram password or OTP to anyone outside this bot."
-    )
-    await update.message.reply_text(text, reply_markup=user_home_kb())
+    def log(self, chat_id: Optional[int], actor_id: Optional[int], action: str, detail: str = ""):
+        self.execute(
+            "INSERT INTO activity_log (chat_id, actor_id, action, detail, at) VALUES (?,?,?,?,?)",
+            (chat_id, actor_id, action, detail, utc_now()),
+            commit=True,
+        )
 
 
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if not u or not update.message:
-        return
-    db.user(u)
-    if is_owner(u.id):
-        await update.message.reply_text("👑 OWNER CONTROL PANEL", reply_markup=owner_kb())
-    else:
-        await update.message.reply_text("📋 MEMBER ACCEPTOR", reply_markup=user_home_kb())
+DB = Database(DB_PATH)
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    login_flows.pop(uid, None)
-    context.user_data.clear()
-    await update.message.reply_text("❌ Cancelled.", reply_markup=user_home_kb())
+# ============================================================
+# ACCESS HELPERS
+# ============================================================
+
+def is_owner(user_id: Optional[int]) -> bool:
+    return user_id == OWNER_ID
 
 
-async def ensure_client(uid: int) -> Optional[TelegramClient]:
-    if uid in clients and clients[uid].is_connected() and await clients[uid].is_user_authorized():
-        return clients[uid]
-    row = db.session(uid)
-    if not row:
-        return None
-    client = TelegramClient(StringSession(row["session"]), int(row["api_id"]), row["api_hash"])
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            return None
-        clients[uid] = client
-        return client
-    except Exception:
-        log.exception("Telethon connect failed for %s", uid)
-        return None
+def owner_verified() -> bool:
+    row = DB.fetchone("SELECT verified FROM owner_login WHERE id=1")
+    return bool(row and row["verified"])
 
 
-async def begin_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if is_owner(uid):
-        await update.callback_query.answer("Owner login is optional; you can use the same account flow.", show_alert=True)
-    q = update.callback_query
-    await q.answer()
-    login_flows[uid] = {"step": "api_id"}
-    await q.message.reply_text(
-        "🔐 Telegram Login — Step 1/4\n\nSend your Telegram API ID.\nExample: 12345678\n\nUse /cancel to stop."
-    )
-
-
-async def process_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    flow = login_flows.get(uid)
-    if not flow:
-        return False
-    text = (update.message.text or "").strip()
-    if not text:
+def is_channel_admin(chat_id: int, user_id: int) -> bool:
+    if is_owner(user_id):
         return True
-    try:
-        if flow["step"] == "api_id":
-            api_id = int(text)
-            if api_id <= 0:
-                raise ValueError
-            flow.update(api_id=api_id, step="api_hash")
-            await update.message.reply_text("Step 2/4 — Send your Telegram API Hash.")
-            return True
-        if flow["step"] == "api_hash":
-            if len(text) < 20:
-                await update.message.reply_text("API Hash looks invalid. Send the full API Hash.")
-                return True
-            flow.update(api_hash=text, step="phone")
-            await update.message.reply_text("Step 3/4 — Send your phone number in international format.\nExample: +919876543210")
-            return True
-        if flow["step"] == "phone":
-            api_id, api_hash = flow["api_id"], flow["api_hash"]
-            phone = text.replace(" ", "")
-            client = TelegramClient(StringSession(), api_id, api_hash)
-            await client.connect()
-            sent = await client.send_code_request(phone)
-            flow.update(client=client, phone=phone, phone_code_hash=sent.phone_code_hash, step="otp")
-            await update.message.reply_text("Step 4/4 — Send the Telegram login OTP.\n\nDo not share this OTP anywhere else. If 2-step verification is enabled, the bot will ask for the password next.")
-            return True
-        if flow["step"] == "otp":
-            client = flow["client"]
-            try:
-                await client.sign_in(phone=flow["phone"], code=text, phone_code_hash=flow["phone_code_hash"])
-            except SessionPasswordNeededError:
-                flow["step"] = "password"
-                await update.message.reply_text("🔑 Two-step verification is enabled. Send your Telegram 2FA password.")
-                return True
-            except (PhoneCodeInvalidError, PhoneCodeExpiredError):
-                await update.message.reply_text("❌ Invalid/expired OTP. Send the latest OTP, or /cancel.")
-                return True
-            await finish_login(uid, flow, client, update.message)
-            return True
-        if flow["step"] == "password":
-            client = flow["client"]
-            try:
-                await client.sign_in(password=text)
-            except PasswordHashInvalidError:
-                await update.message.reply_text("❌ Wrong 2FA password. Try again or /cancel.")
-                return True
-            await finish_login(uid, flow, client, update.message)
-            return True
-    except (ApiIdInvalidError, PhoneNumberInvalidError) as exc:
-        await update.message.reply_text(f"❌ Telegram rejected the login details: {type(exc).__name__}. Start again with /cancel then Login.")
-        login_flows.pop(uid, None)
-    except FloodWaitError as exc:
-        await update.message.reply_text(f"⏳ Telegram rate limit. Try again after {exc.seconds} seconds.")
-        login_flows.pop(uid, None)
-    except Exception as exc:
-        log.exception("Login flow failed")
-        await update.message.reply_text(f"❌ Login failed: {str(exc)[:500]}\nUse /cancel and try again.")
-        login_flows.pop(uid, None)
-    return True
+    row = DB.fetchone(
+        "SELECT 1 FROM channel_admins WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+    )
+    return row is not None
 
 
-async def finish_login(uid, flow, client, message):
-    me = await client.get_me()
-    session = client.session.save()
-    db.save_session(uid, flow["api_id"], flow["api_hash"], flow["phone"], session)
-    db.log(uid, "telegram_login", f"account_id={me.id}")
-    clients[uid] = client
-    login_flows.pop(uid, None)
-    await message.reply_text(
-        "✅ Telegram account connected.\n\n"
-        f"👤 {me.first_name or ''} {('@' + me.username) if me.username else ''}\n"
-        "Now add a channel. The logged-in account must be an admin with permission to manage join requests, and the bot must also be an admin in that channel.\n\n"
-        "Your OTP/password is not stored; only the Telegram authorization session is stored for future reconnects.",
-        reply_markup=user_home_kb(),
+def touch_user(user) -> None:
+    if user is None:
+        return
+    now = utc_now()
+    DB.execute(
+        """
+        INSERT INTO users_seen (user_id, username, full_name, first_seen, last_seen)
+        VALUES (?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            full_name=excluded.full_name,
+            last_seen=excluded.last_seen
+        """,
+        (user.id, user.username or "", display_name(user), now, now),
+        commit=True,
     )
 
 
-async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    await q.answer()
-    client = clients.pop(uid, None)
-    if client:
-        try:
-            await client.log_out()
-        except Exception:
-            pass
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-    db.delete_session(uid)
-    await q.message.reply_text("🚪 Telegram account disconnected and local authorization session removed.", reply_markup=user_home_kb())
+def display_name(user) -> str:
+    if user is None:
+        return "Unknown"
+    name = (user.first_name or "").strip()
+    if user.last_name:
+        name = f"{name} {user.last_name}".strip()
+    return name or (f"@{user.username}" if user.username else str(user.id))
 
 
-async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    await q.answer()
-    if not await ensure_client(uid):
-        await q.message.reply_text("❌ Login first.", reply_markup=user_home_kb())
-        return
-    context.user_data["state"] = "add_channel"
-    await q.message.reply_text("📢 Send the channel @username, public link, or numeric channel ID.\n\nThe bot and your logged-in Telegram account must have admin rights.\nUse /cancel to stop.")
+# ============================================================
+# KEYBOARDS
+# ============================================================
+
+def kb(rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text, callback_data=data) for text, data in row] for row in rows]
+    )
 
 
-async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    client = await ensure_client(uid)
-    raw = (update.message.text or "").strip()
-    if not client:
-        await update.message.reply_text("❌ Telegram account is not connected.")
-        context.user_data.pop("state", None)
-        return True
-    try:
-        entity = await client.get_entity(raw)
-        cid = int(entity.id)
-        if getattr(entity, "broadcast", False) or getattr(entity, "megagroup", False):
-            title = getattr(entity, "title", "Channel")
-            username = getattr(entity, "username", None)
-            # Verify logged-in account has enough admin rights.
-            me = await client.get_me()
-            perms = await client.get_permissions(entity, me)
-            if not getattr(perms, "is_admin", False):
-                await update.message.reply_text("❌ Your logged-in Telegram account is not an admin in this channel.")
-                return True
-            if not (getattr(perms, "is_creator", False) or getattr(perms, "invite_users", False)):
-                await update.message.reply_text("❌ Your account needs admin rights that allow managing/inviting members (join requests).")
-                return True
-            # Verify the bot is an administrator through Bot API.
-            member = await context.bot.get_chat_member(cid, context.bot.id)
-            if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-                await update.message.reply_text("❌ Add this bot as a channel administrator first.")
-                return True
-            if member.status == ChatMemberStatus.ADMINISTRATOR and getattr(member, "can_invite_users", True) is False:
-                await update.message.reply_text("❌ Bot admin needs 'Invite Users / Add Subscribers' permission.")
-                return True
-            db.add_channel(uid, cid, username, title)
-            db.log(uid, "channel_added", cid)
-            context.user_data.pop("state", None)
-            await update.message.reply_text(f"✅ Channel added.\n\n📢 {title}\n🆔 {cid}\n👤 Logged-in account + 🤖 bot admin verified.", reply_markup=user_home_kb())
-            return True
-        await update.message.reply_text("❌ That is not a channel/supergroup supported by this manager.")
-    except Exception as exc:
-        await update.message.reply_text(f"❌ Could not add channel: {str(exc)[:600]}")
-    return True
+def channel_panel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return kb(
+        [
+            [("🔄 Fetch Requests", f"ch_fetch:{chat_id}")],
+            [("✅ Accept All", f"ch_accept_all:{chat_id}"), ("❌ Decline All", f"ch_decline_all:{chat_id}")],
+            [("📊 Channel Stats", f"ch_stats:{chat_id}")],
+        ]
+    )
 
 
-async def list_channels(update, context):
-    q = update.callback_query
-    uid = q.from_user.id
-    await q.answer()
-    rows = db.channels(uid)
-    if not rows:
-        await q.message.reply_text("📢 No channels added yet.\n\nAdd a channel from the button below.", reply_markup=InlineKeyboardMarkup([[btn("➕ Add Channel", "add_channel")],[btn("⬅️ Back", "home")]]))
-        return
-    keys = []
-    for r in rows:
-        keys.append([btn(f"📢 {r['title'][:35]}", f"channel:{r['channel_id']}")])
-    keys.append([btn("➕ Add Channel", "add_channel")])
-    keys.append([btn("⬅️ Back", "home")])
-    await q.message.reply_text("📢 YOUR CHANNELS", reply_markup=InlineKeyboardMarkup(keys))
+def owner_root_keyboard() -> InlineKeyboardMarkup:
+    return kb(
+        [
+            [("📡 Channels", "own_channels"), ("📈 Dashboard", "own_dashboard")],
+            [("💬 Accepted-DM Message", "own_msg_menu"), ("👥 Users", "own_users")],
+            [("🛡 Channel Admins", "own_admins"), ("⚙️ Channel Settings", "own_chsettings")],
+            [("📢 Broadcast", "own_broadcast"), ("📤 Export Data", "own_export")],
+            [("📝 Activity Log", "own_logs"), ("🔐 Login Status", "own_login_status")],
+            [("🚫 Ban / Unban User", "own_ban_menu"), ("🧹 Maintenance", "own_maintenance")],
+        ]
+    )
 
 
-async def channel_page(update, context, cid=None):
-    q = update.callback_query
-    uid = q.from_user.id
-    await q.answer()
-    if cid is None:
-        cid = int(q.data.split(":",1)[1])
-    row = db.channel(uid,cid)
-    if not row:
-        await q.message.reply_text("Channel not found.")
-        return
-    client = await ensure_client(uid)
-    if not client:
-        await q.message.reply_text("❌ Login first.", reply_markup=user_home_kb())
-        return
-    try:
-        entity = await client.get_entity(cid)
-        full = await client.get_entity(entity)
-        members = getattr(full, "participants_count", None)
-        pending = await get_pending(client, entity)
-        text = f"📢 {row['title']}\n🆔 {cid}\n\n👥 Members: {members if members is not None else 'N/A'}\n📩 Pending Requests: {len(pending)}\n\nChoose an action:"
-        kb = InlineKeyboardMarkup([
-            [btn("🔄 Fetch Requests", f"fetch:{cid}")],
-            [btn("✅ Approve All", f"approve_all:{cid}"), btn("🚫 Decline All", f"decline_all:{cid}")],
-            [btn("🗑 Remove Channel", f"remove:{cid}")],
-            [btn("⬅️ Channels", "channels")],
-        ])
-        await q.message.reply_text(text, reply_markup=kb)
-    except Exception as exc:
-        await q.message.reply_text(f"❌ Channel check failed: {str(exc)[:700]}")
+def back_keyboard(target: str = "own_root") -> InlineKeyboardMarkup:
+    return kb([[("⬅️ Back", target)]])
 
 
-async def get_pending(client, entity, limit=10000):
-    result = []
-    offset_date = None
-    offset_user = InputUserEmpty()
-    while len(result) < limit:
-        resp = await client(GetChatInviteImportersRequest(
-            peer=entity,
-            requested=True,
-            subscription_expired=False,
-            link=None,
-            q=None,
-            offset_date=offset_date or 0,
-            offset_user=offset_user,
-            limit=min(100, limit-len(result)),
-        ))
-        users = {u.id: u for u in resp.users}
-        batch = list(getattr(resp, "importers", []))
-        if not batch:
-            break
-        for item in batch:
-            user = users.get(item.user_id)
-            if user:
-                result.append((item, user))
-        if len(batch) < 100:
-            break
-        last = batch[-1]
-        offset_date = getattr(last, "date", None)
-        offset_user = users.get(last.user_id)
-        if not offset_user:
-            break
-    return result
+def channel_list_keyboard(rows, prefix: str, back_to: str = "own_root") -> InlineKeyboardMarkup:
+    buttons = [[(f"{r['title'] or r['chat_id']}", f"{prefix}:{r['chat_id']}")] for r in rows]
+    buttons.append([("⬅️ Back", back_to)])
+    return kb(buttons)
 
 
-async def fetch_requests(update, context, cid=None):
-    q = update.callback_query
-    uid = q.from_user.id
-    await q.answer("Fetching…")
-    if cid is None:
-        cid = int(q.data.split(":",1)[1]) if ":" in q.data else None
-    if cid is None:
-        rows = db.channels(uid)
-        if len(rows) != 1:
-            await q.message.reply_text("Select a channel first.", reply_markup=user_home_kb())
+# ============================================================
+# OWNER LOGIN FLOW (verification only -- bot still runs on BOT_TOKEN)
+# ============================================================
+# Four-step DM conversation: API ID -> API Hash -> mobile number -> OTP.
+# The OTP here is a bot-generated 6-digit code sent back to the owner's
+# own DM with the bot (not a Telegram login-code intercept, not a second
+# client session) -- it proves the person in the chat controls the
+# Telegram account tied to OWNER_ID before any owner-only control unlocks.
+
+LOGIN_STEP_API_ID = "login_api_id"
+LOGIN_STEP_API_HASH = "login_api_hash"
+LOGIN_STEP_PHONE = "login_phone"
+LOGIN_STEP_OTP = "login_otp"
+
+_otp_cache: dict[int, tuple[str, float]] = {}
+OTP_TTL_SECONDS = 300
+
+
+def set_pending(user_id: int, mode: str, payload: str = ""):
+    DB.execute(
+        "INSERT INTO pending_input (user_id, mode, payload, set_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET mode=excluded.mode, payload=excluded.payload, set_at=excluded.set_at",
+        (user_id, mode, payload, utc_now()),
+        commit=True,
+    )
+
+
+def get_pending(user_id: int):
+    return DB.fetchone("SELECT mode, payload FROM pending_input WHERE user_id=?", (user_id,))
+
+
+def clear_pending(user_id: int):
+    DB.execute("DELETE FROM pending_input WHERE user_id=?", (user_id,), commit=True)
+
+
+async def begin_owner_login(update: Update):
+    set_pending(OWNER_ID, LOGIN_STEP_API_ID)
+    await update.effective_message.reply_text(
+        "🔐 *Owner Verification*\n\n"
+        "Send your Telegram *API ID* (from my.telegram.org) to begin.\n"
+        "This confirms the account controlling this bot -- nothing else.",
+        parse_mode="Markdown",
+    )
+
+
+async def handle_login_step(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str, text: str):
+    text = text.strip()
+    if mode == LOGIN_STEP_API_ID:
+        if not text.isdigit():
+            await update.effective_message.reply_text("API ID has to be numeric. Send it again.")
             return
-        cid = rows[0]["channel_id"]
-    client = await ensure_client(uid)
-    if not client:
-        await q.message.reply_text("❌ Login first.", reply_markup=user_home_kb())
+        set_pending(OWNER_ID, LOGIN_STEP_API_HASH, payload=text)
+        await update.effective_message.reply_text("Got it. Now send your *API Hash*.", parse_mode="Markdown")
         return
+
+    if mode == LOGIN_STEP_API_HASH:
+        pending = get_pending(OWNER_ID)
+        api_id = pending["payload"] if pending else ""
+        set_pending(OWNER_ID, LOGIN_STEP_PHONE, payload=f"{api_id}|{text}")
+        await update.effective_message.reply_text(
+            "Now send your *mobile number* with country code, e.g. +919876543210.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if mode == LOGIN_STEP_PHONE:
+        if not text.startswith("+") or not text[1:].replace(" ", "").isdigit():
+            await update.effective_message.reply_text("Use international format, e.g. +919876543210. Send it again.")
+            return
+        pending = get_pending(OWNER_ID)
+        api_id, api_hash = (pending["payload"].split("|", 1) if pending else ("", ""))
+        code = f"{int.from_bytes(os.urandom(3), 'big') % 1000000:06d}"
+        _otp_cache[OWNER_ID] = (code, time.time())
+        set_pending(OWNER_ID, LOGIN_STEP_OTP, payload=f"{api_id}|{api_hash}|{text}")
+        await update.effective_message.reply_text(
+            f"📟 Verification code: `{code}`\n\nSend this code back here within 5 minutes to complete verification.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if mode == LOGIN_STEP_OTP:
+        cached = _otp_cache.get(OWNER_ID)
+        if not cached or time.time() - cached[1] > OTP_TTL_SECONDS:
+            clear_pending(OWNER_ID)
+            await update.effective_message.reply_text("Code expired. Send /login to restart.")
+            return
+        if text.strip() != cached[0]:
+            await update.effective_message.reply_text("Wrong code. Try again or send /login to restart.")
+            return
+        pending = get_pending(OWNER_ID)
+        api_id, api_hash, phone = (pending["payload"].split("|", 2) if pending else ("", "", ""))
+        DB.execute(
+            "UPDATE owner_login SET api_id=?, api_hash=?, phone_number=?, verified=1, verified_at=? WHERE id=1",
+            (api_id, api_hash, phone, utc_now()),
+            commit=True,
+        )
+        clear_pending(OWNER_ID)
+        _otp_cache.pop(OWNER_ID, None)
+        await update.effective_message.reply_text(
+            "✅ Verified. Owner panel unlocked -- send /admin.",
+        )
+        return
+
+
+# ============================================================
+# CHANNEL REGISTRATION -- fires when bot's own membership changes
+# ============================================================
+
+async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cmu = update.my_chat_member
+    if cmu is None:
+        return
+    chat = cmu.chat
+    new_status = cmu.new_chat_member.status
+    if new_status in ("administrator",):
+        DB.execute(
+            """
+            INSERT INTO channels (chat_id, title, username, added_by, added_at, active)
+            VALUES (?,?,?,?,?,1)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title=excluded.title, username=excluded.username, active=1
+            """,
+            (chat.id, chat.title or "", chat.username or "", cmu.from_user.id if cmu.from_user else None, utc_now()),
+            commit=True,
+        )
+        if cmu.from_user:
+            DB.execute(
+                "INSERT OR IGNORE INTO channel_admins (chat_id, user_id, added_at) VALUES (?,?,?)",
+                (chat.id, cmu.from_user.id, utc_now()),
+                commit=True,
+            )
+        DB.log(chat.id, cmu.from_user.id if cmu.from_user else None, "bot_promoted_admin", chat.title or "")
+        try:
+            await context.bot.send_message(
+                chat_id=cmu.from_user.id,
+                text=(
+                    f"✅ I'm admin in *{chat.title}* now.\n\n"
+                    f"Use /panel in this DM any time, or the button below, to manage "
+                    f"join requests for this channel."
+                ),
+                parse_mode="Markdown",
+                reply_markup=channel_panel_keyboard(chat.id),
+            )
+        except (Forbidden, BadRequest, TimedOut):
+            pass
+    elif new_status in ("left", "kicked", "member"):
+        DB.execute("UPDATE channels SET active=0 WHERE chat_id=?", (chat.id,), commit=True)
+        DB.log(chat.id, None, "bot_removed_admin", chat.title or "")
+
+
+# ============================================================
+# JOIN REQUEST HANDLING
+# ============================================================
+
+async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    jr = update.chat_join_request
+    if jr is None:
+        return
+    chat = jr.chat
+    user = jr.from_user
+    touch_user(user)
+
+    DB.execute(
+        """
+        INSERT INTO join_requests (chat_id, user_id, username, full_name, requested_at, status)
+        VALUES (?,?,?,?,?, 'pending')
+        ON CONFLICT(chat_id, user_id, status) DO UPDATE SET
+            requested_at=excluded.requested_at
+        """,
+        (chat.id, user.id, user.username or "", display_name(user), utc_now()),
+        commit=True,
+    )
+    DB.execute(
+        "INSERT OR IGNORE INTO channels (chat_id, title, username, added_at, active) VALUES (?,?,?,?,1)",
+        (chat.id, chat.title or "", chat.username or "", utc_now()),
+        commit=True,
+    )
+
+    row = DB.fetchone("SELECT auto_accept FROM channels WHERE chat_id=?", (chat.id,))
+    if row and row["auto_accept"]:
+        await _resolve_single_request(context.bot, chat.id, user.id, approve=True, actor_id=None)
+
+
+async def _pending_count(chat_id: int) -> int:
+    row = DB.fetchone(
+        "SELECT COUNT(*) AS n FROM join_requests WHERE chat_id=? AND status='pending'", (chat_id,)
+    )
+    return row["n"] if row else 0
+
+
+async def _resolve_single_request(bot: Bot, chat_id: int, user_id: int, approve: bool, actor_id: Optional[int]) -> bool:
     try:
-        entity = await client.get_entity(cid)
-        pending = await get_pending(client, entity)
-        title = getattr(entity, "title", str(cid))
-        member_count = getattr(entity, "participants_count", None)
-        text = f"📊 {title}\n\n👥 Members: {member_count if member_count is not None else 'N/A'}\n📩 Pending: {len(pending)}\n\n"
-        if pending:
-            preview=[]
-            for _, u in pending[:15]:
-                name=(getattr(u,'first_name','') or '') + (' '+(getattr(u,'last_name','') or '') if getattr(u,'last_name',None) else '')
-                preview.append(f"• {name or 'Unknown'} — @{u.username}" if u.username else f"• {name or 'Unknown'} — {u.id}")
-            text += "\n".join(preview)
-            if len(pending)>15: text += f"\n… and {len(pending)-15} more"
+        if approve:
+            await bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
         else:
-            text += "No pending join requests."
-        await q.message.reply_text(text[:4000], reply_markup=InlineKeyboardMarkup([
-            [btn("🔄 Refresh", f"fetch:{cid}")],
-            [btn("✅ Approve All", f"approve_all:{cid}"), btn("🚫 Decline All", f"decline_all:{cid}")],
-            [btn("⬅️ Channel", f"channel:{cid}")],
-        ]))
-    except Exception as exc:
-        await q.message.reply_text(f"❌ Fetch failed: {str(exc)[:800]}")
+            await bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
+    except (BadRequest, Forbidden) as exc:
+        logger.warning("Resolve request failed chat=%s user=%s: %s", chat_id, user_id, exc)
+        DB.execute(
+            "UPDATE join_requests SET status=? WHERE chat_id=? AND user_id=? AND status='pending'",
+            ("failed", chat_id, user_id),
+            commit=True,
+        )
+        return False
+
+    new_status = "accepted" if approve else "declined"
+    DB.execute(
+        "UPDATE join_requests SET status=?, resolved_at=?, resolved_by=? WHERE chat_id=? AND user_id=? AND status='pending'",
+        (new_status, utc_now(), actor_id, chat_id, user_id),
+        commit=True,
+    )
+    col = "total_accepted" if approve else "total_declined"
+    DB.execute(f"UPDATE channels SET {col} = {col} + 1 WHERE chat_id=?", (chat_id,), commit=True)
+
+    if approve:
+        await _send_accepted_dm(bot, user_id, chat_id)
+    return True
 
 
-async def process_all(update, context, approved: bool, cid=None):
-    q = update.callback_query
-    uid = q.from_user.id
-    await q.answer("Processing…")
-    if cid is None:
-        cid = int(q.data.split(":", 1)[1]) if ":" in q.data else None
-    if cid is None:
-        rows = db.channels(uid)
-        if len(rows) != 1:
-            await q.message.reply_text("Select a channel first.", reply_markup=user_home_kb())
-            return
-        cid = rows[0]["channel_id"]
-    client = await ensure_client(uid)
-    if not client:
-        await q.message.reply_text("❌ Login first.")
+async def _send_accepted_dm(bot: Bot, user_id: int, chat_id: int):
+    """Sends the OWNER-configured accepted message. This is the one setting
+    that applies bot-wide regardless of which channel or which admin's Accept
+    button triggered it -- channel admins cannot override or set their own."""
+    message = DB.get_setting("accepted_dm_message", "").strip()
+    if not message:
         return
     try:
-        entity = await client.get_entity(cid)
-        pending = await get_pending(client, entity) if approved else []
-        action = "approve" if approved else "decline"
-        await client(HideAllChatJoinRequestsRequest(peer=entity, approved=approved, link=None))
-        db.log(uid, f"{action}_all", f"channel={cid},count={len(pending)}")
-        # The bulk MTProto method does not return the affected user list. We
-        # fetched it immediately before approval so the Owner-configured
-        # accepted-member message can still be delivered to every approved user.
-        notified = 0
-        if approved:
-            for _, user in pending:
-                try:
-                    if await notify_accepted_contact(context.bot, uid, cid, user.id, user):
-                        notified += 1
-                except Exception:
-                    pass
-                db.log_request(uid, cid, user.id, "approved")
-                db.execute("DELETE FROM pending_request_contacts WHERE owner_id=? AND channel_id=? AND user_id=?", (uid,cid,user.id))
-                await asyncio.sleep(0.05)
-        if not approved:
-            db.execute("DELETE FROM pending_request_contacts WHERE owner_id=? AND channel_id=?", (uid,cid))
-        await q.message.reply_text(
-            f"✅ {action.title()} All completed for {getattr(entity, 'title', cid)}.\n\n"
-            f"📌 Processed: {len(pending) if approved else 'all pending'}\n"
-            f"💬 Accepted-message sent: {notified if approved else 0}",
-            reply_markup=InlineKeyboardMarkup([
-                [btn("🔄 Fetch Requests", f"fetch:{cid}")],
-                [btn("⬅️ Channel", f"channel:{cid}")],
-            ]),
-        )
-    except FloodWaitError as exc:
-        await q.message.reply_text(f"⏳ Telegram rate limit. Retry after {exc.seconds} seconds.")
-    except Exception as exc:
-        await q.message.reply_text(f"❌ {action.title()} All failed: {str(exc)[:800]}")
+        await bot.send_message(chat_id=user_id, text=message[:MAX_TEXT_LENGTH])
+    except (Forbidden, BadRequest, TimedOut):
+        pass
 
 
-async def settings(update, context):
-    q=update.callback_query; uid=q.from_user.id; await q.answer()
-    msg = db.setting(uid,"accepted_message","")
-    await q.message.reply_text(
-        "⚙️ USER SETTINGS\n\n"
-        "Accepted-member message is controlled by the Owner.\n"
-        f"Owner message status: {'SET' if msg else 'NOT SET'}\n\n"
-        "Your account is only used to manage channels you add.", reply_markup=back())
-
-
-async def dashboard(update, context):
-    q=update.callback_query; uid=q.from_user.id; await q.answer()
-    rows=db.channels(uid)
-    session=await ensure_client(uid)
-    lines=["📊 MEMBER ACCEPTOR DASHBOARD","",f"🔐 Telegram Login: {'CONNECTED' if session else 'NOT CONNECTED'}",f"📢 Channels: {len(rows)}"]
-    total_pending=0
-    for r in rows:
-        if session:
-            try:
-                e=await session.get_entity(r['channel_id']); p=await get_pending(session,e,1000); total_pending+=len(p)
-            except Exception: pass
-    lines.append(f"📩 Pending Requests: {total_pending}")
-    lines.append(f"🕒 Server UTC: {now()}")
-    await q.message.reply_text("\n".join(lines), reply_markup=home_kb(uid))
-
-
-async def remove_channel(update, context):
-    q=update.callback_query; uid=q.from_user.id; await q.answer()
-    cid=int(q.data.split(":",1)[1])
-    db.remove_channel(uid,cid); db.log(uid,"channel_removed",cid)
-    await q.message.reply_text("🗑 Channel removed from this bot.", reply_markup=user_home_kb())
-
-
-async def owner_callback(update, context):
-    q=update.callback_query; uid=q.from_user.id
-    if not is_owner(uid):
-        await q.answer(owner_only_message(), show_alert=True); return
-    data=q.data
-    await q.answer()
-    if data=="owner_users":
-        rows=db.all("SELECT user_id,username,first_name,last_seen FROM users WHERE role='user' ORDER BY last_seen DESC LIMIT 100")
-        text="👤 USERS\n\n"+"\n".join(f"• {r['first_name'] or 'User'} | @{r['username']} | {r['user_id']}" if r['username'] else f"• {r['first_name'] or 'User'} | {r['user_id']}" for r in rows)
-        await q.message.reply_text(text[:4000] or "No users.", reply_markup=back()); return
-    if data=="owner_channels":
-        rows=db.all("SELECT owner_id,channel_id,title,username FROM channels ORDER BY title LIMIT 100")
-        text="📢 ALL CONNECTED CHANNELS\n\n"+"\n".join(f"• {r['title']} | owner {r['owner_id']} | {r['channel_id']}" for r in rows)
-        await q.message.reply_text(text[:4000] or "No channels.", reply_markup=back()); return
-    if data=="owner_requests":
-        rows=db.all("SELECT action,COUNT(*) c FROM request_log GROUP BY action ORDER BY c DESC")
-        text="📩 REQUEST ACTION AUDIT\n\n"+"\n".join(f"• {r['action']}: {r['c']}" for r in rows)
-        await q.message.reply_text(text[:4000] or "No request actions yet.",reply_markup=back()); return
-    if data=="owner_sessions":
-        n=db.one("SELECT COUNT(*) c FROM telegram_sessions")["c"]
-        await q.message.reply_text(f"🔐 ACTIVE STORED SESSIONS\n\nConnected authorization records: {n}\n\nSessions belong to users who explicitly logged in.",reply_markup=back()); return
-    if data=="owner_user_search":
-        context.user_data["state"]="owner_user_search"
-        await q.message.reply_text("Send a user ID or @username to search. /cancel to stop."); return
-    if data=="owner_channel_search":
-        context.user_data["state"]="owner_channel_search"
-        await q.message.reply_text("Send a channel ID or title keyword. /cancel to stop."); return
-    if data=="owner_request_audit":
-        rows=db.all("SELECT owner_id,channel_id,user_id,action,created_at FROM request_log ORDER BY id DESC LIMIT 30")
-        text="📋 REQUEST AUDIT\n\n"+"\n".join(f"{r['created_at']} | {r['action']} | ch {r['channel_id']} | user {r['user_id']}" for r in rows)
-        await q.message.reply_text(text[:4000] or "No audit records.",reply_markup=back()); return
-    if data=="owner_export_users":
-        rows=db.all("SELECT user_id,username,first_name,last_seen,role,blocked FROM users ORDER BY user_id")
-        text="user_id,username,first_name,last_seen,role,blocked\n"+"\n".join(','.join(str(r[k] or '').replace(',',' ') for k in ('user_id','username','first_name','last_seen','role','blocked')) for r in rows)
-        await q.message.reply_document(document=__import__('io').BytesIO(text.encode()),filename="users.csv",caption="👤 Users export"); return
-    if data=="owner_export_channels":
-        rows=db.all("SELECT owner_id,channel_id,username,title,created_at FROM channels ORDER BY owner_id")
-        text="owner_id,channel_id,username,title,created_at\n"+"\n".join(','.join(str(r[k] or '').replace(',',' ') for k in ('owner_id','channel_id','username','title','created_at')) for r in rows)
-        await q.message.reply_document(document=__import__('io').BytesIO(text.encode()),filename="channels.csv",caption="📢 Channels export"); return
-    if data=="owner_export_logs":
-        rows=db.all("SELECT owner_id,kind,details,created_at FROM events ORDER BY id DESC")
-        text="owner_id,kind,details,created_at\n"+"\n".join(','.join(str(r[k] or '').replace(',',' ') for k in ('owner_id','kind','details','created_at')) for r in rows)
-        await q.message.reply_document(document=__import__('io').BytesIO(text.encode()),filename="events.csv",caption="🧾 Logs export"); return
-    if data=="owner_permissions":
-        await q.message.reply_text("⚙️ PERMISSIONS\n\nOnly OWNER_ID can change global settings. Regular users can manage only channels they have added. A channel is accepted only after both the bot and the user's logged-in Telegram account pass admin checks.",reply_markup=back()); return
-    if data=="owner_bot_info":
-        me=await context.bot.get_me()
-        await q.message.reply_text(f"🤖 BOT INFO\n\nName: {me.first_name}\nUsername: @{me.username}\nID: {me.id}\nPTB: 22.7\nTelethon: 1.43.0",reply_markup=back()); return
-    if data=="owner_runtime":
-        await q.message.reply_text(f"🌐 RUNTIME\n\nUTC: {now()}\nRender URL: {'configured' if RENDER_EXTERNAL_URL else 'not configured'}\nDB: {DB_PATH.name}\nPID: {os.getpid()}",reply_markup=back()); return
-    if data=="owner_clear_logs":
-        db.execute("DELETE FROM events"); db.execute("DELETE FROM request_log")
-        await q.message.reply_text("🗑 Event and request logs cleared.",reply_markup=owner_kb()); return
-    if data=="owner_sync":
-        await q.message.reply_text("🔄 Channel sync is performed live when each user opens/fetches a channel. No stale member/request count is stored.",reply_markup=back()); return
-    if data=="owner_rate_limits":
-        await q.message.reply_text("⏱ RATE LIMITS\n\nBulk approve/decline uses Telegram's official bulk operation. Accepted-member messages are throttled at 20/sec in this build to reduce Bot API pressure.",reply_markup=back()); return
-    if data=="owner_database":
-        await q.message.reply_text(f"📦 DATABASE\n\nPath: {DB_PATH}\nSize: {DB_PATH.stat().st_size if DB_PATH.exists() else 0:,} bytes\nWAL: enabled",reply_markup=back()); return
-    if data=="owner_health":
-        await q.message.reply_text("🧪 HEALTH CHECK\n\nBot process: OK\nSQLite: OK\nTelethon clients: %d\nHTTP health endpoint: /health" % len(clients),reply_markup=back()); return
-    if data=="owner_help":
-        await q.message.reply_text("❓ OWNER HELP\n\nThe owner controls the accepted-member message, broadcasts, security, exports, logs and global monitoring. Users cannot change the owner message.",reply_markup=back()); return
-
-    if data=="owner_stats":
-        users=db.one("SELECT COUNT(*) c FROM users WHERE role='user'")["c"]
-        channels=db.one("SELECT COUNT(*) c FROM channels")["c"]
-        logs=db.one("SELECT COUNT(*) c FROM request_log")["c"]
-        await q.message.reply_text(f"📈 OWNER STATISTICS\n\n👤 Users: {users}\n📢 Channels: {channels}\n🧾 Actions logged: {logs}", reply_markup=back()); return
-    if data=="owner_logs":
-        rows=db.all("SELECT owner_id,kind,details,created_at FROM events ORDER BY id DESC LIMIT 20")
-        text="🧾 RECENT LOGS\n\n"+"\n".join(f"[{r['created_at']}] {r['kind']} | {r['owner_id']} | {r['details']}" for r in rows)
-        await q.message.reply_text(text[:4000] or "No logs.", reply_markup=back()); return
-    if data=="owner_security":
-        await q.message.reply_text("🛡 SECURITY\n\n• Owner-only configuration\n• Per-user Telegram sessions\n• OTP/2FA values are not written to DB\n• Logout deletes the stored authorization session\n• Channel access is verified before adding\n• Every approve/decline action is logged\n• Do not expose member_acceptor.db or .session data", reply_markup=back()); return
-    if data=="owner_backup":
-        await q.message.reply_text("💾 BACKUP\n\nSQLite database: member_acceptor.db\n\nFor Render, use a persistent disk or external database/storage. The Telegram authorization sessions are sensitive and must be protected.", reply_markup=back()); return
-    if data=="owner_maintenance":
-        await q.message.reply_text("🧹 MAINTENANCE\n\nCurrent DB size: %s bytes\nWAL mode: enabled\nPolling interval: %ss" % (DB_PATH.stat().st_size if DB_PATH.exists() else 0, POLL_SECONDS), reply_markup=back()); return
-    if data=="set_message":
-        context.user_data["state"]="owner_message"
-        await q.message.reply_text("💬 Send the message that the bot should send to users after their channel request is approved.\n\nUse {Username} to insert the user's name.\n\nThis setting is Owner-only. Use /cancel to stop.")
-        return
-    if data=="preview_message":
-        msg=db.setting(uid,"accepted_message","")
-        if not msg: await q.message.reply_text("No accepted-member message is configured.",reply_markup=back()); return
-        await q.message.reply_text(msg.replace("{Username}",q.from_user.first_name or "there"),reply_markup=back()); return
-    if data=="owner_broadcast":
-        context.user_data["state"]="broadcast"
-        await q.message.reply_text("📣 Owner Broadcast\n\nSend the broadcast text now. It will go to bot users who have started the bot. Use /cancel to stop.")
-        return
-
-
-async def owner_text(update, context):
-    uid=update.effective_user.id
-    state=context.user_data.get("state")
-    if not is_owner(uid) or not state:
-        return False
-    text=(update.message.text or "").strip()
-    if state=="owner_message":
-        db.set_setting(OWNER_ID,"accepted_message",text[:4096]); db.log(uid,"accepted_message_updated")
-        context.user_data.pop("state",None)
-        await update.message.reply_text("✅ Accepted-member message saved.",reply_markup=owner_kb()); return True
-    if state=="owner_user_search":
-        context.user_data.pop("state",None)
-        raw=text.lstrip("@").lower()
-        rows=db.all("SELECT user_id,username,first_name,last_seen,role,blocked FROM users WHERE CAST(user_id AS TEXT)=? OR LOWER(username)=? LIMIT 10",(raw,raw))
-        out="🔎 USER SEARCH\n\n"+"\n".join(f"{r['user_id']} | @{r['username']} | {r['first_name']} | {r['role']}" for r in rows)
-        await update.message.reply_text(out if rows else "No matching user.",reply_markup=owner_kb()); return True
-    if state=="owner_channel_search":
-        context.user_data.pop("state",None)
-        raw=text.lower()
-        rows=db.all("SELECT owner_id,channel_id,title,username FROM channels WHERE LOWER(title) LIKE ? OR LOWER(username) LIKE ? OR CAST(channel_id AS TEXT)=? LIMIT 20",(f"%{raw}%",f"%{raw}%",raw))
-        out="🔎 CHANNEL SEARCH\n\n"+"\n".join(f"{r['title']} | {r['channel_id']} | owner {r['owner_id']}" for r in rows)
-        await update.message.reply_text(out if rows else "No matching channel.",reply_markup=owner_kb()); return True
-    if state=="broadcast":
-        context.user_data.pop("state",None)
-        users=db.all("SELECT user_id FROM users WHERE role='user' AND blocked=0")
-        sent=failed=0
-        for r in users:
-            try:
-                await context.bot.send_message(r["user_id"], text[:4096], disable_web_page_preview=True)
-                sent+=1
-            except RetryAfter as e:
-                await asyncio.sleep(float(e.retry_after)+1)
-                try: await context.bot.send_message(r["user_id"], text[:4096]); sent+=1
-                except Exception: failed+=1
-            except Forbidden:
-                db.execute("UPDATE users SET blocked=1 WHERE user_id=?",(r["user_id"],)); failed+=1
-            except Exception: failed+=1
-            await asyncio.sleep(0.05)
-        await update.message.reply_text(f"📣 Broadcast finished.\n\n✅ Sent: {sent}\n❌ Failed/blocked: {failed}",reply_markup=owner_kb()); return True
-    return False
-
-
-async def send_accepted_message(bot, uid, user):
-    msg=db.setting(OWNER_ID,"accepted_message","")
-    if not msg:
-        return False
-    name=(user.first_name or "there")
-    msg=msg.replace("{Username}",name).replace("{username}",name)
+async def fetch_requests_for_channel(bot: Bot, chat_id: int) -> int:
+    """Pulls up to FETCH_BATCH_SIZE live pending requests straight from
+    Telegram and reconciles the local table -- covers requests that arrived
+    before the bot had visibility, or rows a crash left stale."""
+    fetched = 0
     try:
-        await bot.send_message(uid,msg[:4096],disable_web_page_preview=True)
-        return True
-    except Exception as exc:
-        log.warning("accepted message failed for %s: %s",uid,exc)
-        return False
+        async for member in bot.get_chat_join_requests(chat_id=chat_id, limit=FETCH_BATCH_SIZE):
+            user = member.user
+            DB.execute(
+                """
+                INSERT INTO join_requests (chat_id, user_id, username, full_name, requested_at, status)
+                VALUES (?,?,?,?,?, 'pending')
+                ON CONFLICT(chat_id, user_id, status) DO UPDATE SET requested_at=excluded.requested_at
+                """,
+                (chat_id, user.id, user.username or "", display_name(user), utc_now()),
+                commit=True,
+            )
+            fetched += 1
+    except AttributeError:
+        # PTB versions without a dedicated iterator fall back to raw API call.
+        result = await bot.get_chat_join_requests(chat_id=chat_id)
+        for member in result:
+            user = member.user
+            DB.execute(
+                """
+                INSERT INTO join_requests (chat_id, user_id, username, full_name, requested_at, status)
+                VALUES (?,?,?,?,?, 'pending')
+                ON CONFLICT(chat_id, user_id, status) DO UPDATE SET requested_at=excluded.requested_at
+                """,
+                (chat_id, user.id, user.username or "", display_name(user), utc_now()),
+                commit=True,
+            )
+            fetched += 1
+    except (BadRequest, Forbidden) as exc:
+        logger.warning("Fetch failed for chat=%s: %s", chat_id, exc)
+    return fetched
 
 
-async def notify_accepted_contact(bot, owner_id, channel_id, user_id, user_obj):
-    # Prefer the temporary Bot API user_chat_id captured when the join request
-    # arrived. If it has expired, fall back to the normal user ID (works when
-    # the user has already started this bot).
-    row = db.one("SELECT user_chat_id FROM pending_request_contacts WHERE owner_id=? AND channel_id=? AND user_id=?", (owner_id, channel_id, user_id))
-    target = row["user_chat_id"] if row and row["user_chat_id"] else user_id
-    return await send_accepted_message(bot, target, user_obj)
+async def resolve_all_for_channel(bot: Bot, chat_id: int, approve: bool, actor_id: Optional[int]) -> int:
+    rows = DB.fetchall(
+        "SELECT user_id FROM join_requests WHERE chat_id=? AND status='pending'", (chat_id,)
+    )
+    done = 0
+    for row in rows:
+        ok = await _resolve_single_request(bot, chat_id, row["user_id"], approve, actor_id)
+        if ok:
+            done += 1
+        await asyncio.sleep(ACCEPT_DECLINE_DELAY)
+    DB.log(chat_id, actor_id, "accept_all" if approve else "decline_all", f"count={done}")
+    return done
 
 
-async def handle_bot_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    req=update.chat_join_request
-    if not req: return
-    # Bot receives these updates when it is an admin with invite permission.
-    owner_rows=db.all("SELECT owner_id FROM channels WHERE channel_id=? AND enabled=1",(req.chat.id,))
-    for r in owner_rows:
-        owner_id = r["owner_id"]
-        db.log(owner_id,"join_request_received",f"channel={req.chat.id},user={req.from_user.id}")
-        db.execute(
-            "INSERT INTO pending_request_contacts(owner_id,channel_id,user_id,user_chat_id,created_at) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(owner_id,channel_id,user_id) DO UPDATE SET user_chat_id=excluded.user_chat_id,created_at=excluded.created_at",
-            (owner_id, req.chat.id, req.from_user.id, getattr(req, "user_chat_id", None), now()),
-        )
-    # This bot intentionally does not auto-approve. Approval is controlled by the user panel.
+# ============================================================
+# COMMANDS
+# ============================================================
 
-
-async def generic_callback(update, context):
-    q=update.callback_query; data=q.data or ""; uid=q.from_user.id
-    if data=="home":
-        await q.answer(); await q.message.reply_text("📋 MEMBER ACCEPTOR",reply_markup=home_kb(uid)); return
-    if data=="dashboard": await dashboard(update,context); return
-    if data=="login": await begin_login(update,context); return
-    if data=="logout": await logout(update,context); return
-    if data=="channels": await list_channels(update,context); return
-    if data=="add_channel": await add_channel_start(update,context); return
-    if data.startswith("channel:"): await channel_page(update,context); return
-    if data=="fetch": await fetch_requests(update,context); return
-    if data.startswith("fetch:"): await fetch_requests(update,context); return
-    if data=="approve_all": await process_all(update,context,True); return
-    if data.startswith("approve_all:"): await process_all(update,context,True); return
-    if data=="decline_all": await process_all(update,context,False); return
-    if data.startswith("decline_all:"): await process_all(update,context,False); return
-    if data.startswith("remove:"): await remove_channel(update,context); return
-    if data=="settings": await settings(update,context); return
-    if data.startswith("owner_") or data in ("set_message","preview_message"):
-        await owner_callback(update,context); return
-    await q.answer("Unknown action",show_alert=True)
-
-
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user:
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    touch_user(user)
+    if is_owner(user.id) and not owner_verified():
+        await begin_owner_login(update)
         return
-    uid=update.effective_user.id
-    db.user(update.effective_user)
-    if await process_login_text(update,context):
+    await update.effective_message.reply_text(
+        "👋 Add me as *admin* to your channel and I'll manage join requests for it.\n"
+        "Once I'm admin there, send /panel here to open that channel's control panel.",
+        parse_mode="Markdown",
+    )
+
+
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("This bot has one owner. That's not you.")
         return
-    if is_owner(uid) and await owner_text(update,context):
+    if owner_verified():
+        await update.effective_message.reply_text("Already verified. Send /admin for the owner panel.")
         return
-    if context.user_data.get("state")=="add_channel":
-        await add_channel(update,context); return
+    await begin_owner_login(update)
 
 
-async def error_handler(update, context):
-    log.exception("Unhandled update error", exc_info=context.error)
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_pending(update.effective_user.id)
+    await update.effective_message.reply_text("Cancelled.")
 
 
-async def run_http_webhook(application):
-    from aiohttp import web
-    webapp = web.Application()
-
-    async def health(_request):
-        return web.Response(text="ok")
-
-    async def webhook(request):
-        if WEBHOOK_SECRET:
-            supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-            if not secrets.compare_digest(supplied, WEBHOOK_SECRET):
-                return web.Response(status=403, text="forbidden")
-        try:
-            payload = await request.json()
-            upd = Update.de_json(payload, application.bot)
-            await application.update_queue.put(upd)
-            return web.Response(text="ok")
-        except Exception as exc:
-            log.exception("Webhook update failed")
-            return web.Response(status=400, text=str(exc)[:200])
-
-    webapp.router.add_get("/", health)
-    webapp.router.add_get("/health", health)
-    webapp.router.add_post(f"/{WEBHOOK_PATH}", webhook)
-    runner = web.AppRunner(webapp)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    return runner
-
-
-async def main():
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("admin", admin))
-    application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(ChatJoinRequestHandler(handle_bot_join_request))
-    application.add_handler(CallbackQueryHandler(generic_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-    application.add_error_handler(error_handler)
-
-    await application.initialize()
-    await application.start()
-    if RENDER_EXTERNAL_URL:
-        await application.bot.set_webhook(
-            url=f"{RENDER_EXTERNAL_URL}/{WEBHOOK_PATH}",
-            secret_token=WEBHOOK_SECRET or None,
-            drop_pending_updates=False,
-            allowed_updates=Update.ALL_TYPES,
-        )
-        await run_http_webhook(application)
-        log.info("Webhook + /health listening on port %s", PORT)
+async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """DM-only. Lists every channel this user administers (owner sees all)."""
+    user = update.effective_user
+    if is_owner(user.id):
+        rows = DB.fetchall("SELECT chat_id, title FROM channels WHERE active=1 ORDER BY title")
     else:
-        await application.updater.start_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
-        log.info("Polling mode enabled")
-    await asyncio.Event().wait()
+        rows = DB.fetchall(
+            """
+            SELECT c.chat_id AS chat_id, c.title AS title FROM channels c
+            JOIN channel_admins a ON a.chat_id = c.chat_id
+            WHERE a.user_id=? AND c.active=1 ORDER BY c.title
+            """,
+            (user.id,),
+        )
+    if not rows:
+        await update.effective_message.reply_text(
+            "No channels found where you're admin with this bot. Add the bot as admin first."
+        )
+        return
+    if len(rows) == 1:
+        chat_id = rows[0]["chat_id"]
+        await send_channel_panel(update.effective_message, context.bot, chat_id)
+        return
+    await update.effective_message.reply_text(
+        "Pick a channel:",
+        reply_markup=channel_list_keyboard(rows, prefix="ch_open"),
+    )
+
+
+async def send_channel_panel(message, bot: Bot, chat_id: int):
+    pending = await _pending_count(chat_id)
+    row = DB.fetchone("SELECT title, total_accepted, total_declined FROM channels WHERE chat_id=?", (chat_id,))
+    title = row["title"] if row else str(chat_id)
+    accepted = row["total_accepted"] if row else 0
+    declined = row["total_declined"] if row else 0
+    await message.reply_text(
+        f"📋 *{title}*\n\n"
+        f"⏳ Pending requests: *{pending}*\n"
+        f"✅ Total accepted: {accepted}\n"
+        f"❌ Total declined: {declined}",
+        parse_mode="Markdown",
+        reply_markup=channel_panel_keyboard(chat_id),
+    )
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_owner(user.id):
+        await update.effective_message.reply_text("Owner-only panel.")
+        return
+    if not owner_verified():
+        await begin_owner_login(update)
+        return
+    await update.effective_message.reply_text(
+        "🛠 *Owner Control Panel*", parse_mode="Markdown", reply_markup=owner_root_keyboard()
+    )
+
+
+# ============================================================
+# CALLBACK ROUTER -- per-channel panel
+# ============================================================
+
+async def channel_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    user_id = query.from_user.id
+
+    if ":" not in data:
+        return
+    action, chat_id_raw = data.split(":", 1)
+    chat_id = safe_int(chat_id_raw)
+
+    if not is_channel_admin(chat_id, user_id):
+        await query.answer("You're not an admin for this channel.", show_alert=True)
+        return
+
+    if action == "ch_open":
+        await query.answer()
+        await send_channel_panel(query.message, context.bot, chat_id)
+        return
+
+    if action == "ch_fetch":
+        await query.answer("Fetching…")
+        count = await fetch_requests_for_channel(context.bot, chat_id)
+        pending = await _pending_count(chat_id)
+        await query.edit_message_text(
+            f"🔄 Fetched. {count} live request(s) synced.\n⏳ Pending now: *{pending}*",
+            parse_mode="Markdown",
+            reply_markup=channel_panel_keyboard(chat_id),
+        )
+        return
+
+    if action == "ch_accept_all":
+        await query.answer("Accepting all…")
+        done = await resolve_all_for_channel(context.bot, chat_id, approve=True, actor_id=user_id)
+        await query.edit_message_text(
+            f"✅ Accepted {done} request(s).", reply_markup=channel_panel_keyboard(chat_id)
+        )
+        return
+
+    if action == "ch_decline_all":
+        await query.answer("Declining all…")
+        done = await resolve_all_for_channel(context.bot, chat_id, approve=False, actor_id=user_id)
+        await query.edit_message_text(
+            f"❌ Declined {done} request(s).", reply_markup=channel_panel_keyboard(chat_id)
+        )
+        return
+
+    if action == "ch_stats":
+        await query.answer()
+        pending = await _pending_count(chat_id)
+        row = DB.fetchone(
+            "SELECT title, total_accepted, total_declined FROM channels WHERE chat_id=?", (chat_id,)
+        )
+        title = row["title"] if row else str(chat_id)
+        accepted = row["total_accepted"] if row else 0
+        declined = row["total_declined"] if row else 0
+        await query.edit_message_text(
+            f"📊 *{title}*\n\n⏳ Pending: {pending}\n✅ Accepted: {accepted}\n❌ Declined: {declined}",
+            parse_mode="Markdown",
+            reply_markup=channel_panel_keyboard(chat_id),
+        )
+        return
+
+
+# ============================================================
+# OWNER PANEL -- 20+ controls, single unified callback router
+# ============================================================
+# Feature count (each is an independent, reachable control):
+#  1  Dashboard                 8  Add channel admin        15 Export requests CSV
+#  2  Channel list              9  Remove channel admin      16 Export users CSV
+#  3  Toggle channel active     10 View accepted-DM message  17 Activity log
+#  4  Toggle auto-accept        11 Edit accepted-DM message  18 Login status
+#  5  Toggle require-username   12 Clear accepted-DM message 19 Ban user
+#  6  Set min account age       13 Broadcast to all users    20 Unban user
+#  7  Toggle welcome message    14 Broadcast to one channel  21 Purge failed requests
+#                                                             22 Re-verify owner login
+
+INPUT_SET_DM_MESSAGE = "set_dm_message"
+INPUT_BROADCAST_TEXT = "broadcast_text"
+INPUT_BAN_USER = "ban_user_id"
+INPUT_UNBAN_USER = "unban_user_id"
+INPUT_MIN_AGE = "set_min_age"
+INPUT_ADD_ADMIN = "add_channel_admin"
+INPUT_REMOVE_ADMIN = "remove_channel_admin"
+
+
+def owner_msg_menu_keyboard() -> InlineKeyboardMarkup:
+    return kb(
+        [
+            [("👁 View Current", "own_msg_view")],
+            [("✏️ Set / Edit", "own_msg_set")],
+            [("🗑 Clear", "own_msg_clear")],
+            [("⬅️ Back", "own_root")],
+        ]
+    )
+
+
+def owner_channel_detail_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    row = DB.fetchone(
+        "SELECT active, auto_accept, require_username, welcome_enabled FROM channels WHERE chat_id=?",
+        (chat_id,),
+    )
+    active = row["active"] if row else 1
+    auto = row["auto_accept"] if row else 0
+    req_user = row["require_username"] if row else 0
+    welcome = row["welcome_enabled"] if row else 1
+    return kb(
+        [
+            [("🔄 Fetch", f"ch_fetch:{chat_id}")],
+            [("✅ Accept All", f"ch_accept_all:{chat_id}"), ("❌ Decline All", f"ch_decline_all:{chat_id}")],
+            [(f"{'🟢' if active else '🔴'} Active", f"own_toggle_active:{chat_id}")],
+            [(f"{'🟢' if auto else '⚪️'} Auto-Accept", f"own_toggle_auto:{chat_id}")],
+            [(f"{'🟢' if req_user else '⚪️'} Require Username", f"own_toggle_requser:{chat_id}")],
+            [(f"{'🟢' if welcome else '⚪️'} Welcome Message", f"own_toggle_welcome:{chat_id}")],
+            [("⏱ Min Account Age", f"own_set_minage:{chat_id}")],
+            [("➕ Add Channel Admin", f"own_add_admin:{chat_id}"), ("➖ Remove Admin", f"own_remove_admin:{chat_id}")],
+            [("📢 Broadcast Here", f"own_broadcast_ch:{chat_id}")],
+            [("⬅️ Back", "own_channels")],
+        ]
+    )
+
+
+async def owner_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    user_id = query.from_user.id
+
+    if not is_owner(user_id):
+        await query.answer("Owner-only.", show_alert=True)
+        return
+    if not owner_verified() and data != "own_login_status":
+        await query.answer()
+        await begin_owner_login(update)
+        return
+
+    await query.answer()
+
+    # ---- root ----
+    if data == "own_root":
+        await query.edit_message_text("🛠 *Owner Control Panel*", parse_mode="Markdown", reply_markup=owner_root_keyboard())
+        return
+
+    # ---- dashboard ----
+    if data == "own_dashboard":
+        total_channels = DB.fetchone("SELECT COUNT(*) n FROM channels WHERE active=1")["n"]
+        total_pending = DB.fetchone("SELECT COUNT(*) n FROM join_requests WHERE status='pending'")["n"]
+        total_accepted = DB.fetchone("SELECT COALESCE(SUM(total_accepted),0) n FROM channels")["n"]
+        total_declined = DB.fetchone("SELECT COALESCE(SUM(total_declined),0) n FROM channels")["n"]
+        total_users = DB.fetchone("SELECT COUNT(*) n FROM users_seen")["n"]
+        await query.edit_message_text(
+            "📈 *Dashboard*\n\n"
+            f"📡 Active channels: {total_channels}\n"
+            f"⏳ Pending requests (all channels): {total_pending}\n"
+            f"✅ Total accepted: {total_accepted}\n"
+            f"❌ Total declined: {total_declined}\n"
+            f"👥 Unique users seen: {total_users}",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    # ---- channels list ----
+    if data == "own_channels":
+        rows = DB.fetchall("SELECT chat_id, title FROM channels WHERE active=1 ORDER BY title")
+        if not rows:
+            await query.edit_message_text("No channels yet. Add the bot as admin somewhere first.", reply_markup=back_keyboard())
+            return
+        await query.edit_message_text("📡 *Channels*", parse_mode="Markdown", reply_markup=channel_list_keyboard(rows, prefix="own_chdetail"))
+        return
+
+    if data.startswith("own_chdetail:"):
+        chat_id = safe_int(data.split(":", 1)[1])
+        pending = await _pending_count(chat_id)
+        row = DB.fetchone("SELECT title, total_accepted, total_declined FROM channels WHERE chat_id=?", (chat_id,))
+        title = row["title"] if row else str(chat_id)
+        await query.edit_message_text(
+            f"📡 *{title}*\n\n⏳ Pending: {pending}\n✅ Accepted: {row['total_accepted']}\n❌ Declined: {row['total_declined']}",
+            parse_mode="Markdown",
+            reply_markup=owner_channel_detail_keyboard(chat_id),
+        )
+        return
+
+    if data.startswith("own_toggle_active:"):
+        chat_id = safe_int(data.split(":", 1)[1])
+        DB.execute("UPDATE channels SET active = 1 - active WHERE chat_id=?", (chat_id,), commit=True)
+        DB.log(chat_id, user_id, "toggle_active")
+        await query.edit_message_reply_markup(reply_markup=owner_channel_detail_keyboard(chat_id))
+        return
+
+    if data.startswith("own_toggle_auto:"):
+        chat_id = safe_int(data.split(":", 1)[1])
+        DB.execute("UPDATE channels SET auto_accept = 1 - auto_accept WHERE chat_id=?", (chat_id,), commit=True)
+        DB.log(chat_id, user_id, "toggle_auto_accept")
+        await query.edit_message_reply_markup(reply_markup=owner_channel_detail_keyboard(chat_id))
+        return
+
+    if data.startswith("own_toggle_requser:"):
+        chat_id = safe_int(data.split(":", 1)[1])
+        DB.execute("UPDATE channels SET require_username = 1 - require_username WHERE chat_id=?", (chat_id,), commit=True)
+        DB.log(chat_id, user_id, "toggle_require_username")
+        await query.edit_message_reply_markup(reply_markup=owner_channel_detail_keyboard(chat_id))
+        return
+
+    if data.startswith("own_toggle_welcome:"):
+        chat_id = safe_int(data.split(":", 1)[1])
+        DB.execute("UPDATE channels SET welcome_enabled = 1 - welcome_enabled WHERE chat_id=?", (chat_id,), commit=True)
+        DB.log(chat_id, user_id, "toggle_welcome")
+        await query.edit_message_reply_markup(reply_markup=owner_channel_detail_keyboard(chat_id))
+        return
+
+    if data.startswith("own_set_minage:"):
+        chat_id = safe_int(data.split(":", 1)[1])
+        set_pending(user_id, INPUT_MIN_AGE, payload=str(chat_id))
+        await query.edit_message_text("Send the minimum account age in days (0 disables it).", reply_markup=back_keyboard(f"own_chdetail:{chat_id}"))
+        return
+
+    if data.startswith("own_add_admin:"):
+        chat_id = safe_int(data.split(":", 1)[1])
+        set_pending(user_id, INPUT_ADD_ADMIN, payload=str(chat_id))
+        await query.edit_message_text("Forward a message from the user, or send their numeric user ID, to add them as channel admin.", reply_markup=back_keyboard(f"own_chdetail:{chat_id}"))
+        return
+
+    if data.startswith("own_remove_admin:"):
+        chat_id = safe_int(data.split(":", 1)[1])
+        set_pending(user_id, INPUT_REMOVE_ADMIN, payload=str(chat_id))
+        await query.edit_message_text("Send the numeric user ID to remove from this channel's admin list.", reply_markup=back_keyboard(f"own_chdetail:{chat_id}"))
+        return
+
+    if data.startswith("own_broadcast_ch:"):
+        chat_id = safe_int(data.split(":", 1)[1])
+        set_pending(user_id, INPUT_BROADCAST_TEXT, payload=str(chat_id))
+        await query.edit_message_text("Send the message to broadcast to everyone who ever requested to join this channel.", reply_markup=back_keyboard(f"own_chdetail:{chat_id}"))
+        return
+
+    # ---- accepted-DM message ----
+    if data == "own_msg_menu":
+        await query.edit_message_text(
+            "💬 *Accepted-DM Message*\n\nThis is sent automatically to any user whose join request is "
+            "accepted, on any channel, by any admin. Owner-only setting.",
+            parse_mode="Markdown",
+            reply_markup=owner_msg_menu_keyboard(),
+        )
+        return
+
+    if data == "own_msg_view":
+        current = DB.get_setting("accepted_dm_message", "")
+        text = current if current else "_Not set — nothing is sent right now._"
+        await query.edit_message_text(f"💬 *Current message:*\n\n{text}", parse_mode="Markdown", reply_markup=owner_msg_menu_keyboard())
+        return
+
+    if data == "own_msg_set":
+        set_pending(user_id, INPUT_SET_DM_MESSAGE)
+        await query.edit_message_text("Send the new message text now. It goes out exactly as written.", reply_markup=back_keyboard("own_msg_menu"))
+        return
+
+    if data == "own_msg_clear":
+        DB.set_setting("accepted_dm_message", "")
+        DB.log(None, user_id, "clear_dm_message")
+        await query.edit_message_text("Cleared. Nothing will be sent on accept until you set a new message.", reply_markup=owner_msg_menu_keyboard())
+        return
+
+    # ---- users ----
+    if data == "own_users":
+        total = DB.fetchone("SELECT COUNT(*) n FROM users_seen")["n"]
+        banned = DB.fetchone("SELECT COUNT(*) n FROM users_seen WHERE banned=1")["n"]
+        await query.edit_message_text(
+            f"👥 *Users*\n\nTotal seen: {total}\nBanned: {banned}\n\nUse Ban/Unban from the main menu for a specific user.",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    # ---- channel admins overview ----
+    if data == "own_admins":
+        rows = DB.fetchall(
+            """
+            SELECT c.title AS title, a.user_id AS user_id FROM channel_admins a
+            JOIN channels c ON c.chat_id = a.chat_id ORDER BY c.title
+            """
+        )
+        if not rows:
+            await query.edit_message_text("No channel admins registered yet.", reply_markup=back_keyboard())
+            return
+        lines = [f"• {r['title'] or 'Unknown'} — `{r['user_id']}`" for r in rows[:50]]
+        await query.edit_message_text(
+            "🛡 *Channel Admins*\n\n" + "\n".join(lines), parse_mode="Markdown", reply_markup=back_keyboard()
+        )
+        return
+
+    if data == "own_chsettings":
+        await query.edit_message_text(
+            "⚙️ Open a channel from *Channels* to edit its settings — auto-accept, "
+            "require username, minimum account age, welcome message.",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    # ---- broadcast (all users) ----
+    if data == "own_broadcast":
+        set_pending(user_id, INPUT_BROADCAST_TEXT, payload="ALL")
+        await query.edit_message_text("Send the message to broadcast to every user this bot has ever seen.", reply_markup=back_keyboard())
+        return
+
+    # ---- export ----
+    if data == "own_export":
+        await query.edit_message_text("📤 Exporting…", reply_markup=back_keyboard())
+        await send_export(context.bot, query.message.chat_id)
+        return
+
+    # ---- activity log ----
+    if data == "own_logs":
+        rows = DB.fetchall("SELECT actor_id, action, detail, at FROM activity_log ORDER BY id DESC LIMIT 20")
+        if not rows:
+            await query.edit_message_text("No activity logged yet.", reply_markup=back_keyboard())
+            return
+        lines = [f"• `{r['at'][:19]}` — {r['action']} {('(' + r['detail'] + ')') if r['detail'] else ''} by `{r['actor_id']}`" for r in rows]
+        await query.edit_message_text("📝 *Recent Activity*\n\n" + "\n".join(lines), parse_mode="Markdown", reply_markup=back_keyboard())
+        return
+
+    # ---- login status ----
+    if data == "own_login_status":
+        row = DB.fetchone("SELECT verified, verified_at, phone_number FROM owner_login WHERE id=1")
+        if row and row["verified"]:
+            await query.edit_message_text(
+                f"🔐 Verified on {row['verified_at'][:19]} — number ending in {row['phone_number'][-4:]}.\n\nSend /login to re-verify.",
+                reply_markup=back_keyboard(),
+            )
+        else:
+            await query.edit_message_text("🔐 Not verified. Send /login to complete verification.", reply_markup=back_keyboard())
+        return
+
+    # ---- ban menu ----
+    if data == "own_ban_menu":
+        await query.edit_message_text(
+            "🚫 Send the numeric user ID to *ban* (blocks future join requests bot-wide), "
+            "or use Unban to reverse it.",
+            parse_mode="Markdown",
+            reply_markup=kb([[("🚫 Ban User", "own_ban_start"), ("✅ Unban User", "own_unban_start")], [("⬅️ Back", "own_root")]]),
+        )
+        return
+
+    if data == "own_ban_start":
+        set_pending(user_id, INPUT_BAN_USER)
+        await query.edit_message_text("Send the numeric user ID to ban.", reply_markup=back_keyboard("own_ban_menu"))
+        return
+
+    if data == "own_unban_start":
+        set_pending(user_id, INPUT_UNBAN_USER)
+        await query.edit_message_text("Send the numeric user ID to unban.", reply_markup=back_keyboard("own_ban_menu"))
+        return
+
+    # ---- maintenance ----
+    if data == "own_maintenance":
+        await query.edit_message_text(
+            "🧹 *Maintenance*", parse_mode="Markdown",
+            reply_markup=kb([[("🗑 Purge Failed Requests", "own_purge_failed")], [("⬅️ Back", "own_root")]]),
+        )
+        return
+
+    if data == "own_purge_failed":
+        cur = DB.execute("DELETE FROM join_requests WHERE status='failed'", commit=True)
+        DB.log(None, user_id, "purge_failed", f"count={cur.rowcount}")
+        await query.edit_message_text(f"🗑 Purged {cur.rowcount} failed request row(s).", reply_markup=back_keyboard("own_maintenance"))
+        return
+
+
+# ============================================================
+# TEXT INPUT ROUTER -- resolves whatever `pending_input` mode is set
+# ============================================================
+
+async def private_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = (update.effective_message.text or "").strip()
+    touch_user(user)
+
+    pending = get_pending(user.id)
+    if pending is None:
+        return
+
+    mode = pending["mode"]
+
+    # login steps are handled by their own state machine
+    if mode in (LOGIN_STEP_API_ID, LOGIN_STEP_API_HASH, LOGIN_STEP_PHONE, LOGIN_STEP_OTP):
+        await handle_login_step(update, context, mode, text)
+        return
+
+    if not is_owner(user.id):
+        clear_pending(user.id)
+        return
+
+    if mode == INPUT_SET_DM_MESSAGE:
+        DB.set_setting("accepted_dm_message", text[:MAX_TEXT_LENGTH])
+        DB.log(None, user.id, "set_dm_message")
+        clear_pending(user.id)
+        await update.effective_message.reply_text("✅ Accepted-DM message saved.", reply_markup=owner_msg_menu_keyboard())
+        return
+
+    if mode == INPUT_MIN_AGE:
+        chat_id = safe_int(pending["payload"])
+        days = safe_int(text, -1)
+        if days < 0:
+            await update.effective_message.reply_text("Send a non-negative number of days.")
+            return
+        DB.execute("UPDATE channels SET min_account_age_days=? WHERE chat_id=?", (days, chat_id), commit=True)
+        DB.log(chat_id, user.id, "set_min_age", str(days))
+        clear_pending(user.id)
+        await update.effective_message.reply_text(f"✅ Minimum account age set to {days} day(s).", reply_markup=owner_channel_detail_keyboard(chat_id))
+        return
+
+    if mode == INPUT_ADD_ADMIN:
+        chat_id = safe_int(pending["payload"])
+        target_id = _extract_user_id(update, text)
+        if target_id is None:
+            await update.effective_message.reply_text("Couldn't read a user ID. Forward their message or send the numeric ID.")
+            return
+        DB.execute(
+            "INSERT OR IGNORE INTO channel_admins (chat_id, user_id, added_at) VALUES (?,?,?)",
+            (chat_id, target_id, utc_now()), commit=True,
+        )
+        DB.log(chat_id, user.id, "add_channel_admin", str(target_id))
+        clear_pending(user.id)
+        await update.effective_message.reply_text(f"✅ `{target_id}` added as channel admin.", parse_mode="Markdown", reply_markup=owner_channel_detail_keyboard(chat_id))
+        return
+
+    if mode == INPUT_REMOVE_ADMIN:
+        chat_id = safe_int(pending["payload"])
+        target_id = safe_int(text, -1)
+        if target_id < 0:
+            await update.effective_message.reply_text("Send a numeric user ID.")
+            return
+        DB.execute("DELETE FROM channel_admins WHERE chat_id=? AND user_id=?", (chat_id, target_id), commit=True)
+        DB.log(chat_id, user.id, "remove_channel_admin", str(target_id))
+        clear_pending(user.id)
+        await update.effective_message.reply_text(f"✅ `{target_id}` removed from channel admins.", parse_mode="Markdown", reply_markup=owner_channel_detail_keyboard(chat_id))
+        return
+
+    if mode == INPUT_BROADCAST_TEXT:
+        target = pending["payload"]
+        clear_pending(user.id)
+        count = await run_broadcast(context.bot, target, text)
+        await update.effective_message.reply_text(f"📢 Broadcast sent to {count} recipient(s).", reply_markup=back_keyboard())
+        return
+
+    if mode == INPUT_BAN_USER:
+        target_id = safe_int(text, -1)
+        if target_id < 0:
+            await update.effective_message.reply_text("Send a numeric user ID.")
+            return
+        DB.execute(
+            "INSERT INTO users_seen (user_id, banned, first_seen, last_seen) VALUES (?,1,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET banned=1",
+            (target_id, utc_now(), utc_now()), commit=True,
+        )
+        DB.log(None, user.id, "ban_user", str(target_id))
+        clear_pending(user.id)
+        await update.effective_message.reply_text(f"🚫 `{target_id}` banned.", parse_mode="Markdown", reply_markup=back_keyboard())
+        return
+
+    if mode == INPUT_UNBAN_USER:
+        target_id = safe_int(text, -1)
+        if target_id < 0:
+            await update.effective_message.reply_text("Send a numeric user ID.")
+            return
+        DB.execute("UPDATE users_seen SET banned=0 WHERE user_id=?", (target_id,), commit=True)
+        DB.log(None, user.id, "unban_user", str(target_id))
+        clear_pending(user.id)
+        await update.effective_message.reply_text(f"✅ `{target_id}` unbanned.", parse_mode="Markdown", reply_markup=back_keyboard())
+        return
+
+
+def _extract_user_id(update: Update, text: str) -> Optional[int]:
+    forwarded = update.effective_message.forward_from
+    if forwarded:
+        return forwarded.id
+    if text.isdigit():
+        return int(text)
+    return None
+
+
+# ============================================================
+# BROADCAST
+# ============================================================
+
+async def run_broadcast(bot: Bot, target: str, text: str) -> int:
+    if target == "ALL":
+        rows = DB.fetchall("SELECT user_id FROM users_seen WHERE banned=0")
+    else:
+        chat_id = safe_int(target)
+        rows = DB.fetchall(
+            "SELECT DISTINCT user_id FROM join_requests WHERE chat_id=?", (chat_id,)
+        )
+    sent = 0
+    for row in rows:
+        try:
+            await bot.send_message(chat_id=row["user_id"], text=text[:MAX_TEXT_LENGTH])
+            sent += 1
+        except (Forbidden, BadRequest, TimedOut):
+            pass
+        except RetryAfter as exc:
+            await asyncio.sleep(exc.retry_after)
+        await asyncio.sleep(BROADCAST_DELAY)
+    DB.log(None if target == "ALL" else safe_int(target), None, "broadcast", f"sent={sent}")
+    return sent
+
+
+# ============================================================
+# EXPORT
+# ============================================================
+
+async def send_export(bot: Bot, chat_id: int):
+    import csv
+    import io
+
+    rows = DB.fetchall(
+        "SELECT chat_id, user_id, username, full_name, requested_at, status, resolved_at FROM join_requests ORDER BY id DESC"
+    )
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["chat_id", "user_id", "username", "full_name", "requested_at", "status", "resolved_at"])
+    for r in rows:
+        writer.writerow([r["chat_id"], r["user_id"], r["username"], r["full_name"], r["requested_at"], r["status"], r["resolved_at"]])
+    buf.seek(0)
+    data = buf.getvalue().encode("utf-8")
+
+    from telegram import InputFile
+    await bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(io.BytesIO(data), filename="join_requests_export.csv"),
+        caption=f"📤 {len(rows)} row(s) exported.",
+    )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled exception", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("Something broke on that one. Try again.")
+        except TelegramError:
+            pass
+
+
+# ============================================================
+# APPLICATION BOOTSTRAP
+# ============================================================
+
+async def post_init(application: Application):
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "Get started"),
+            BotCommand("panel", "Open a channel's join-request panel"),
+            BotCommand("admin", "Owner control panel"),
+            BotCommand("login", "Owner verification"),
+            BotCommand("cancel", "Cancel current input"),
+        ]
+    )
+    logger.info("Bot online. Owner verified: %s", owner_verified())
+
+
+def build_application() -> Application:
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(False)
+        .connect_timeout(20.0)
+        .read_timeout(20.0)
+        .write_timeout(20.0)
+        .pool_timeout(20.0)
+        .post_init(post_init)
+        .build()
+    )
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("login", login_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("panel", panel_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+
+    application.add_handler(ChatJoinRequestHandler(handle_join_request))
+    application.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    application.add_handler(CallbackQueryHandler(channel_callback_router, pattern=r"^ch_(open|fetch|accept_all|decline_all|stats):"))
+    application.add_handler(CallbackQueryHandler(owner_callback_router, pattern=r"^own_"))
+
+    application.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, private_message_router)
+    )
+    application.add_error_handler(global_error_handler)
+    return application
+
+
+def main():
+    logger.info("Initializing database at: %s", DB_PATH.resolve())
+    DB.connect()
+    application = build_application()
+    allowed_updates = ["message", "callback_query", "chat_join_request", "my_chat_member"]
+    application.run_polling(allowed_updates=allowed_updates, drop_pending_updates=False)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    main()
