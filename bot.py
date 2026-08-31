@@ -1305,7 +1305,19 @@ def main():
     DB.connect()
     application = build_application()
     allowed_updates = ["message", "callback_query", "chat_join_request", "my_chat_member"]
-    application.run_polling(allowed_updates=allowed_updates, drop_pending_updates=False)
+
+    # Python 3.14 no longer creates a main-thread event loop implicitly.
+    # python-telegram-bot's run_polling() expects a current loop before it
+    # enters its runner, so create and register one when needed.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    application.run_polling(
+        allowed_updates=allowed_updates,
+        drop_pending_updates=False,
+    )
 
 
 if __name__ == "__main__":
