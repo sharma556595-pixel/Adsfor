@@ -269,7 +269,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📩 Requests: Fetch pending count and process requests.\n\n"
         "⚠️ Never send your Telegram password or OTP to anyone outside this bot."
     )
-    await update.message.reply_text(text, reply_markup=home_kb(u.id))
+    await update.message.reply_text(text, reply_markup=user_home_kb())
 
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -287,7 +287,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     login_flows.pop(uid, None)
     context.user_data.clear()
-    await update.message.reply_text("❌ Cancelled.", reply_markup=home_kb(uid))
+    await update.message.reply_text("❌ Cancelled.", reply_markup=user_home_kb())
 
 
 async def ensure_client(uid: int) -> Optional[TelegramClient]:
