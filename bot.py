@@ -82,7 +82,7 @@ class Config:
             owner_ids=owners,
             db_path=db_path,
             backup_dir=backup_dir,
-            health_port=int(os.getenv("PORT", os.getenv("HEALTH_PORT", "8080"))),
+            health_port=int(os.getenv("PORT", os.getenv("HEALTH_PORT", "10000"))),
             broadcast_rate=int(os.getenv("BROADCAST_RATE", "25")),
             state_ttl=int(os.getenv("ADMIN_STATE_TTL", "600")),
             timezone=os.getenv("TIMEZONE", "UTC"),
@@ -232,6 +232,7 @@ CREATE TABLE IF NOT EXISTS buttons (
     screen    TEXT NOT NULL,
     text      TEXT NOT NULL,
     emoji     TEXT,
+    icon_custom_emoji_id TEXT,
     kind      TEXT NOT NULL DEFAULT 'callback',   -- callback | url
     url       TEXT,
     callback  TEXT,
@@ -348,16 +349,20 @@ CREATE TABLE IF NOT EXISTS schedules (
 
 DEFAULT_MESSAGES: list[tuple[str, str, str, str]] = [
     ("start", "START", "Welcome",
-     "👋 <b>Welcome, {name}!</b>\n\nTap the button below to get started."),
-    ("force_join", "FORCE JOIN", "Force Join Prompt",
-     "🔒 <b>One step left</b>\n\nJoin the channels below, then press "
-     "<b>✅ I Joined</b> to continue."),
+     "🔥 <b>Fully New Daily Earning Buy &amp; Sell Application</b> 🔥🔥\n\n"
+     "🚨 <b>OMG</b> 😱😱 10% Commission 💸💸\n\n"
+     "👑 <b>₹500 Signup Bonus Available</b>\n\n"
+     "👇 <b>Click On Join Channel 🔥 &amp; Loot Fast</b> 👇"),
+    ("force_join", "FORCE JOIN", "Join Channels Prompt",
+     "🔥 <b>Click On Join Channel &amp; Loot Fast</b> 🔥\n\n"
+     "👇 Join all required channels, then tap <b>Claim 10% App</b>."),
     ("force_join_failed", "FORCE JOIN", "Verification Failed",
-     "❌ You are still missing some channels. Join them all and try again."),
+     "❌ <b>Not Verified Yet</b>\n\nPlease join every required channel and tap <b>Claim 10% App</b> again."),
     ("claim", "CLAIM", "Claim Screen",
-     "🎁 <b>Your reward is ready</b>\n\nPress the claim button below."),
-    ("success", "SUCCESS", "Claim Success",
-     "✅ <b>Done!</b>\n\nYour reward has been claimed successfully."),
+     "🎁 <b>Your 10% App claim is ready!</b>\n\nTap the button below to continue."),
+    ("success", "SUCCESS", "Post Join Success",
+     "🙏 <b>Thank You For Joining!</b>\n\n"
+     "📢 <b>Visit Our Channel For New Apps &amp; All Details</b> 🔥"),
     ("error", "ERROR", "Generic Error",
      "⚠️ Something went wrong. Please try again in a moment."),
     ("help", "HELP", "Help",
@@ -368,26 +373,21 @@ DEFAULT_MESSAGES: list[tuple[str, str, str, str]] = [
      "🛠 <b>Maintenance</b>\n\nThe bot is briefly unavailable. Please come back soon."),
     ("followup", "START", "Follow-up",
      "👀 <b>Still there?</b>\n\nYou have not finished your claim yet."),
-    ("referral", "START", "Referral Info",
-     "🎁 <b>Invite friends</b>\n\nYour link: {ref_link}\nInvited: {ref_count}"),
+    ("referral", "START", "Referral Info", ""),
     ("broadcast_footer", "BROADCAST", "Broadcast Footer", ""),
     ("admin_denied", "ADMIN", "Access Denied",
      "⛔️ You do not have permission for this section."),
 ]
 
 DEFAULT_BUTTONS: list[dict[str, Any]] = [
-    dict(screen="start", text="Get Started", emoji="🚀", kind="callback",
-         callback="flow:claim", style="PRIMARY", row=0, position=0),
-    dict(screen="start", text="Help", emoji="ℹ️", kind="callback",
-         callback="flow:help", style="DEFAULT", row=1, position=0),
-    dict(screen="start", text="Invite Friends", emoji="🎁", kind="callback",
-         callback="flow:referral", style="SUCCESS", row=1, position=1),
-    dict(screen="force_join", text="I Joined", emoji="✅", kind="callback",
+    dict(screen="start", text="Claim 10% App", emoji="✅", kind="callback",
+         callback="flow:claim", style="SUCCESS", row=0, position=0),
+    dict(screen="force_join", text="Claim 10% App", emoji="✅", kind="callback",
          callback="flow:verify", style="SUCCESS", row=99, position=0),
-    dict(screen="claim", text="Claim Now", emoji="🎁", kind="callback",
+    dict(screen="claim", text="Claim 10% App", emoji="🔥", kind="callback",
          callback="flow:claim_confirm", style="PRIMARY", row=0, position=0),
-    dict(screen="success", text="Invite Friends", emoji="🎁", kind="callback",
-         callback="flow:referral", style="SUCCESS", row=0, position=0),
+    dict(screen="success", text="Visit Our Channel", emoji="📢", kind="url",
+         url="https://t.me/", callback=None, style="PRIMARY", row=0, position=0),
 ]
 
 DEFAULT_SETTINGS: list[tuple[str, str, str]] = [
@@ -397,6 +397,8 @@ DEFAULT_SETTINGS: list[tuple[str, str, str]] = [
     ("active_window_days", "7", "general"),
     ("force_join_enabled", "1", "force_join"),
     ("force_join_recheck", "1", "force_join"),
+    ("max_channels", "20", "force_join"),
+    ("channel_check_timeout", "10", "force_join"),
     ("stage_welcome", "1", "journey"),
     ("stage_force_join", "1", "journey"),
     ("stage_claim", "1", "journey"),
@@ -405,7 +407,7 @@ DEFAULT_SETTINGS: list[tuple[str, str, str]] = [
     ("followup_delay_min", "60", "journey"),
     ("broadcast_rate", "25", "broadcast"),
     ("broadcast_retry", "1", "broadcast"),
-    ("referral_enabled", "1", "referral"),
+    ("referral_enabled", "0", "referral"),
     ("referral_reward", "1", "referral"),
     ("referral_min_joins", "1", "referral"),
     ("referral_self_block", "1", "referral"),
@@ -478,6 +480,13 @@ class DB:
 
     async def seed(self) -> None:
         stamp = now()
+        # Safe schema migrations for databases created by older versions.
+        columns = {r[1] for r in await self.fetchall("PRAGMA table_info(buttons)")}
+        if "icon_custom_emoji_id" not in columns:
+            await self.conn.execute("ALTER TABLE buttons ADD COLUMN icon_custom_emoji_id TEXT")
+        # Remove legacy referral UI without deleting historical referral data.
+        await self.conn.execute("UPDATE buttons SET enabled=0 WHERE callback='flow:referral'")
+        await self.conn.execute("UPDATE settings SET value='0' WHERE key='referral_enabled'")
         for key, category, name, content in DEFAULT_MESSAGES:
             await self.conn.execute(
                 "INSERT OR IGNORE INTO messages"
@@ -495,9 +504,9 @@ class DB:
         if not existing:
             for b in DEFAULT_BUTTONS:
                 await self.conn.execute(
-                    "INSERT INTO buttons (screen, text, emoji, kind, url, callback,"
-                    " style, row, position) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (b["screen"], b["text"], b["emoji"], b["kind"], b.get("url"),
+                    "INSERT INTO buttons (screen, text, emoji, icon_custom_emoji_id, kind, url, callback,"
+                    " style, row, position) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (b["screen"], b["text"], b["emoji"], b.get("icon_custom_emoji_id"), b["kind"], b.get("url"),
                      b.get("callback"), b["style"], b["row"], b["position"]),
                 )
         await self.conn.commit()
@@ -1336,20 +1345,28 @@ def user_label(row: Any) -> str:
 # keyboards
 # --------------------------------------------------------------------------
 
-def btn(text: str, data: str, style: str | None = None) -> InlineKeyboardButton:
-    return InlineKeyboardButton(
-        text=text,
-        callback_data=data,
-        style=normalize_style(style) if style is not None else infer_style(text, data),
-    )
+def btn(text: str, data: str, style: str | None = None,
+        icon_custom_emoji_id: str | None = None) -> InlineKeyboardButton:
+    kwargs = {
+        "text": text,
+        "callback_data": data,
+        "style": normalize_style(style) if style is not None else infer_style(text, data),
+    }
+    if icon_custom_emoji_id:
+        kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
+    return InlineKeyboardButton(**kwargs)
 
 
-def url_btn(text: str, url: str, style: str | None = None) -> InlineKeyboardButton:
-    return InlineKeyboardButton(
-        text=text,
-        url=url,
-        style=normalize_style(style) if style is not None else infer_style(text, url),
-    )
+def url_btn(text: str, url: str, style: str | None = None,
+            icon_custom_emoji_id: str | None = None) -> InlineKeyboardButton:
+    kwargs = {
+        "text": text,
+        "url": url,
+        "style": normalize_style(style) if style is not None else infer_style(text, url),
+    }
+    if icon_custom_emoji_id:
+        kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
+    return InlineKeyboardButton(**kwargs)
 
 
 def keyboard(rows: Sequence[Sequence[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
@@ -1431,6 +1448,7 @@ class Wizard(StatesGroup):
 
     button_text = State()
     button_target = State()
+    button_custom_emoji = State()
 
     broadcast_content = State()
     broadcast_buttons = State()
@@ -1703,10 +1721,10 @@ async def build_keyboard(screen: str, extra_rows: list[list[InlineKeyboardButton
     for row in rows:
         label = decorate(row)
         if row["kind"] == "url" and row["url"]:
-            button = url_btn(label, row["url"], row["style"])
+            button = url_btn(label, row["url"], row["style"], row["icon_custom_emoji_id"])
         else:
             callback = row["callback"] or "flow:noop"
-            button = btn(label, callback, row["style"])
+            button = btn(label, callback, row["style"], row["icon_custom_emoji_id"])
         grouped.setdefault(int(row["row"]), []).append(button)
     keyboard = [grouped[k] for k in sorted(grouped)]
     if extra_rows:
@@ -1733,11 +1751,11 @@ async def missing_channels(bot: Bot, tg_id: int) -> list[Any]:
         try:
             member = await bot.get_chat_member(channel["chat_id"], tg_id)
             joined = member.status in MEMBER_OK
-        except TelegramAPIError as exc:
+        except Exception as exc:  # noqa: BLE001
             await capture("CHANNEL", exc, f"get_chat_member {channel['chat_id']}")
-            await Channels.update(channel["id"], last_result="unreachable")
+            await Channels.update(channel["id"], last_check=now(), last_result="unreachable")
             continue
-        await Channels.update(channel["id"], last_result="ok")
+        await Channels.update(channel["id"], last_check=now(), last_result="ok")
         if not joined:
             out.append(channel)
     return out
@@ -1751,13 +1769,26 @@ async def verify(bot: Bot, tg_id: int) -> bool:
     return ok
 
 
-async def join_keyboard(channels: list[Any], verify_cb: str = "flow:verify"
-                        ) -> InlineKeyboardMarkup:
+async def join_keyboard(channels: list[Any], verify_cb: str = "flow:verify") -> InlineKeyboardMarkup:
+    # Screenshot-style 2-column Join grid, followed by one full-width claim button.
     rows: list[list[InlineKeyboardButton]] = []
+    current: list[InlineKeyboardButton] = []
     for channel in channels:
-        link = channel["invite_link"] or f"https://t.me/{str(channel['chat_id']).lstrip('@')}"
-        rows.append([url_btn(f"📢 {channel['title']}", link, "PRIMARY")])
-    rows.append([btn("✅ I Joined", verify_cb, "SUCCESS")])
+        link = channel["invite_link"] or (
+            f"https://t.me/{str(channel['chat_id']).lstrip('@')}"
+            if str(channel["chat_id"]).startswith("@") or str(channel.get("chat_id", "")).lstrip("-").isdigit() is False
+            else channel["invite_link"]
+        )
+        # Private channels should always have an invite_link configured.
+        if not link:
+            continue
+        current.append(url_btn("Join 🔒", link, "PRIMARY"))
+        if len(current) == 2:
+            rows.append(current)
+            current = []
+    if current:
+        rows.append(current)
+    rows.append([btn("✅ Claim 10% App", verify_cb, "SUCCESS")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1813,40 +1844,49 @@ def markup_from_json(raw: str | None) -> InlineKeyboardMarkup | None:
         for item in row:
             text = item.get("text") or "Open"
             if item.get("url"):
-                built.append(url_btn(text, item["url"], item.get("style")))
+                built.append(url_btn(text, item["url"], item.get("style"), item.get("icon_custom_emoji_id")))
             elif item.get("callback"):
-                built.append(btn(text, item["callback"], item.get("style")))
+                built.append(btn(text, item["callback"], item.get("style"), item.get("icon_custom_emoji_id")))
         if built:
             rows.append(built)
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 def parse_button_spec(raw: str) -> str:
-    """Admin types 'Text | https://... ; Text2 | https://...' per line.
+    """Parse admin button rows.
 
-    Each line becomes one keyboard row. Returns JSON for storage.
+    Syntax per button: Text | URL-or-callback | style | custom_emoji_id
+    Multiple buttons on one row are separated by ``;``.
+    Example: ``🔥 Join | https://t.me/example | primary``
     """
     rows: list[list[dict[str, str]]] = []
     for line in raw.splitlines():
         line = line.strip()
         if not line:
             continue
-        row = []
+        row: list[dict[str, str]] = []
         for chunk in line.split(";"):
-            if "|" not in chunk:
+            parts = [p.strip() for p in chunk.split("|")]
+            if len(parts) < 2:
                 continue
-            text, target = chunk.split("|", 1)
-            text, target = text.strip(), target.strip()
+            text, target = parts[0], parts[1]
+            style = parts[2].upper() if len(parts) >= 3 and parts[2] else "DEFAULT"
+            emoji_id = parts[3] if len(parts) >= 4 and parts[3] else None
             if not text or not target:
                 continue
+            if style not in {"PRIMARY", "SUCCESS", "DANGER", "DEFAULT"}:
+                style = "DEFAULT"
+            item: dict[str, str] = {"text": text, "style": style}
             if target.startswith(("http://", "https://", "tg://")):
-                row.append({"text": text, "url": target})
+                item["url"] = target
             else:
-                row.append({"text": text, "callback": target})
+                item["callback"] = target[:64]
+            if emoji_id:
+                item["icon_custom_emoji_id"] = emoji_id
+            row.append(item)
         if row:
             rows.append(row)
-    return json.dumps(rows)
-
+    return json.dumps(rows, ensure_ascii=False)
 
 # --------------------------------------------------------------------------
 # broadcast engine
@@ -1991,8 +2031,14 @@ class Scheduler:
 
     async def stop(self) -> None:
         self.running = False
-        if self.task:
-            self.task.cancel()
+        task = self.task
+        self.task = None
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     async def _loop(self) -> None:
         while self.running:
@@ -2153,7 +2199,6 @@ QUICK_ACTIONS = [
     ("✏️ Messages", cb("msg", "open")),
     ("🔘 Buttons", cb("btn", "open")),
     ("🎯 Campaigns", cb("camp", "open")),
-    ("🎁 Referrals", cb("ref", "open")),
     ("👑 Admins", cb("adm", "open")),
     ("⚙️ Settings", cb("set", "open")),
     ("💾 Database", cb("dbm", "open")),
@@ -2162,7 +2207,7 @@ QUICK_ACTIONS = [
 
 PERMISSION_OF = {
     "stats": "analytics", "users": "users", "bc": "broadcast", "chan": "channels",
-    "msg": "messages", "btn": "buttons", "camp": "campaigns", "ref": "referrals",
+    "msg": "messages", "btn": "buttons", "camp": "campaigns",
     "adm": "admins", "set": "settings", "dbm": "database", "log": "logs",
 }
 
@@ -2231,7 +2276,6 @@ async def cb_stats(call: CallbackQuery, actor: Actor, **_) -> None:
     data = await Stats.analytics(period)
     
 
-    top = await Referrals.top(5)
     clicks, claims = data["claim_clicks"], data["claim_success"]
 
     lines = [
@@ -2254,16 +2298,10 @@ async def cb_stats(call: CallbackQuery, actor: Actor, **_) -> None:
         "<b>🎁 Conversion</b>",
         f"Claim clicks: {num(clicks)}   Successful: {num(claims)}",
         f"Conversion: {bar(claims, clicks or 1)} {pct(claims, clicks or 1)}",
-        f"Referred users: {num(data['referral_users'])}",
         "",
         "<b>📨 Delivery</b>",
         f"Broadcast delivery rate: {data['delivery_rate']:.1f}%",
     ]
-    if top:
-        lines += ["", "<b>🏆 Top Referrers</b>"]
-        for i, row in enumerate(top, start=1):
-            handle = f"@{row['username']}" if row["username"] else str(row["tg_id"])
-            lines.append(f"{i}. {esc(handle)} — {num(row['referral_count'])}")
 
     periods = [(("✅ " if p == period else "") + label, cb("stats", "open", p))
                for p, label in PERIOD_LABELS.items()]
@@ -2439,7 +2477,6 @@ async def user_card(tg_id: int) -> tuple[str, object] | None:
         f"🆔 <b>Telegram ID:</b> <code>{row['tg_id']}</code>",
         f"📅 <b>Joined:</b> {esc(row['joined_at'])} ({ago(row['joined_at'])})",
         f"🕐 <b>Last activity:</b> {ago(row['last_seen_at'])}",
-        f"📊 <b>Referrals:</b> {num(referrals)}",
         f"🎁 <b>Claims:</b> {num(row['claim_count'])}",
         f"📢 <b>Force join:</b> "
         f"{'✅ completed' if row['force_join_ok'] else '❌ not completed'}",
@@ -2931,10 +2968,36 @@ async def do_add_channel(message: Message, state: FSMContext, bot: Bot,
             "Add the bot as an administrator first, then try again.",
         ]), keyboard([cancel_row(cb("chan", "open"))]))
         return
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat.id, me.id)
+        if member.status not in {"administrator", "creator"}:
+            raise RuntimeError("Bot must be an administrator in this channel.")
+        if chat.type not in {"channel", "supergroup"}:
+            raise RuntimeError("Only Telegram channels/supergroups can be used for force join.")
+        link = chat.invite_link or (f"https://t.me/{chat.username}" if chat.username else None)
+        if not link:
+            # Private channel: require a usable invite link before enabling it.
+            await state.clear()
+            cid = await Channels.add(str(chat.id), chat.title or raw, None, actor.tg_id)
+            await audit(actor, "Added private channel", str(chat.id))
+            await state.set_state(Wizard.channel_link)
+            await state.update_data(channel_id=cid)
+            await show(message, screen("🔗 PRIVATE CHANNEL LINK", [
+                f"<b>{esc(chat.title or raw)}</b> was added.",
+                "Send its <code>https://t.me/+...</code> invite link now.",
+                "The channel will remain disabled until a valid link is saved."
+            ]), keyboard([cancel_row(cb("chan", "view", cid))]))
+            return
+        cid = await Channels.add(str(chat.id), chat.title or raw, link, actor.tg_id)
+    except Exception as exc:  # noqa: BLE001
+        await capture("CHANNEL", exc, f"add channel {raw}")
+        await show(message, screen("❌ ADD CHANNEL FAILED", [
+            esc(str(exc)), "",
+            "For private channels, add a valid invite link in the channel settings after adding it."
+        ]), keyboard([cancel_row(cb("chan", "open"))]))
+        return
     await state.clear()
-    link = chat.invite_link or (f"https://t.me/{chat.username}" if chat.username
-                                else None)
-    cid = await Channels.add(str(chat.id), chat.title or raw, link, actor.tg_id)
     await audit(actor, "Added channel", str(chat.id))
     await show(message, *(await channel_card(cid)))
 
@@ -2956,7 +3019,13 @@ async def do_edit_link(message: Message, state: FSMContext, actor: Actor, **_) -
     data = await state.get_data()
     await state.clear()
     cid = int(data.get("channel_id", 0))
-    await Channels.update(cid, invite_link=(message.text or "").strip())
+    link = (message.text or "").strip()
+    if not link.startswith(("https://t.me/", "http://t.me/", "https://telegram.me/", "http://telegram.me/")):
+        await show(message, screen("❌ INVALID INVITE LINK", [
+            "Send a valid Telegram invite link such as <code>https://t.me/+AbCd...</code>."
+        ]), keyboard([cancel_row(cb("chan", "view", cid))]))
+        return
+    await Channels.update(cid, invite_link=link, enabled=1)
     await audit(actor, "Edited channel link", str(cid))
     await show(message, *(await channel_card(cid)))
 
@@ -3180,6 +3249,15 @@ async def cb_buttons(call: CallbackQuery, state: FSMContext, actor: Actor,
             "or a callback name such as <code>flow:claim</code>.",
         ]), keyboard([cancel_row(cb("btn", "view", bid))]))
         return
+    elif action == "custom_emoji":
+        await state.set_state(Wizard.button_custom_emoji)
+        await state.update_data(button_id=bid)
+        await show(call, screen("✨ CUSTOM EMOJI", [
+            "Send the Telegram custom emoji ID.",
+            "Send <code>-</code> to remove it.",
+            "This is optional and works with Telegram Premium/custom emoji support.",
+        ]), keyboard([cancel_row(cb("btn", "view", bid))]))
+        return
     elif action == "confirm_del":
         text, markup = confirm_screen(
             "Delete this button?", f"'{decorate(row)}' will disappear from the keyboard.",
@@ -3205,6 +3283,7 @@ async def cb_buttons(call: CallbackQuery, state: FSMContext, actor: Actor,
         f"🔘 <b>Preview:</b> {esc(decorate(row))}",
         f"📛 <b>Text:</b> {esc(row['text'])}",
         f"😀 <b>Emoji:</b> {esc(row['emoji'] or '—')}",
+        f"✨ <b>Custom Emoji ID:</b> <code>{esc(row['icon_custom_emoji_id'] or '—')}</code>",
         f"🧭 <b>Type:</b> {esc(row['kind'])}",
         f"🔗 <b>Target:</b> <code>{esc(row['url'] or row['callback'] or '—')}</code>",
         f"🎨 <b>Style:</b> {esc(row['style'])} {STYLE_MARK.get(row['style'], '')}",
@@ -3215,7 +3294,8 @@ async def cb_buttons(call: CallbackQuery, state: FSMContext, actor: Actor,
         [btn("✏️ Text", cb("btn", "text", bid)),
          btn("🔗 Target", cb("btn", "target", bid))],
         [btn("🎨 Style", cb("btn", "style", bid)),
-         btn("📋 Duplicate", cb("btn", "dup", bid))],
+         btn("✨ Custom Emoji", cb("btn", "custom_emoji", bid))],
+        [btn("📋 Duplicate", cb("btn", "dup", bid))],
         [btn("⬆️ Row -", cb("btn", "row", bid, -1)),
          btn("⬇️ Row +", cb("btn", "row", bid, 1))],
         [btn("◀️ Pos -", cb("btn", "pos", bid, -1)),
@@ -3264,6 +3344,22 @@ async def do_button_text(message: Message, state: FSMContext, actor: Actor,
         "a URL (<code>https://…</code>) or a callback such as "
         "<code>flow:claim</code>.",
     ]), keyboard([cancel_row(cb("btn", "view", bid))]))
+
+
+@admin_content_router.message(Wizard.button_custom_emoji)
+@requires("buttons")
+async def do_button_custom_emoji(message: Message, state: FSMContext, actor: Actor, **_) -> None:
+    data = await state.get_data()
+    await state.clear()
+    bid = int(data.get("button_id", 0))
+    raw = (message.text or "").strip()
+    value = None if raw == "-" else raw[:256]
+    await Buttons.update(bid, icon_custom_emoji_id=value)
+    await audit(actor, "Changed button custom emoji", str(bid))
+    row = await Buttons.get(bid)
+    await show(message, screen("✅ SAVED", [
+        f"{esc(decorate(row))} custom emoji is now <code>{esc(value or 'disabled')}</code>."
+    ]), keyboard([nav_row(back=cb("btn", "view", bid))]))
 
 
 @admin_content_router.message(Wizard.button_target)
@@ -3485,8 +3581,10 @@ async def cb_broadcast(call: CallbackQuery, state: FSMContext, bot: Bot,
         await state.update_data(broadcast_id=bid)
         await show(call, screen("🔘 BROADCAST BUTTONS", [
             "Send one line per keyboard row:",
-            "<code>Open Site | https://example.com</code>",
-            "<code>Left | https://a.com ; Right | https://b.com</code>",
+            "<code>Open Site | https://example.com | primary</code>",
+            "<code>Left | https://a.com | success ; Right | https://b.com | primary</code>",
+            "<code>Claim | flow:claim_confirm | success | CUSTOM_EMOJI_ID</code>",
+            "Styles: <b>primary</b> 🔵 · <b>success</b> 🟢 · <b>danger</b> 🔴",
             "",
             "Send <b>-</b> to remove all buttons.",
         ]), keyboard([cancel_row(cb("bc", "view", bid))]))
@@ -3513,7 +3611,11 @@ async def cb_broadcast(call: CallbackQuery, state: FSMContext, bot: Bot,
                 sender = {"photo": bot.send_photo, "video": bot.send_video,
                           "document": bot.send_document, "audio": bot.send_audio,
                           "voice": bot.send_voice}[row["kind"]]
-                await sender(actor.tg_id, row["file_id"], reply_markup=markup)
+                kwargs = {"reply_markup": markup}
+                if row["kind"] != "voice":
+                    kwargs["caption"] = row["body"] or None
+                    kwargs["parse_mode"] = row["parse_mode"] or "HTML"
+                await sender(actor.tg_id, row["file_id"], **kwargs)
             await call.answer("👁 Preview sent")
         except Exception as exc:  # noqa: BLE001
             await capture("BROADCAST", exc, f"preview {bid}")
@@ -4558,23 +4660,57 @@ async def start_http_server(bot: Bot, dp: Dispatcher):
             return web.Response(status=500, text="Update processing failed")
 
     app = web.Application()
+    app.router.add_get("/", handle_health)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/healthz", handle_health)
     if webhook_url:
         app.router.add_post("/telegram/webhook", handle_webhook)
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", config.health_port)
-    try:
-        await site.start()
-        health.http_ok = True
-        log.info("HTTP service listening on :%s", config.health_port)
-    except OSError as exc:
-        await capture("HEALTH", exc, "bind HTTP port")
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        config.health_port,
+        reuse_address=True,
+    )
+
+    max_attempts = 9
+    last_bind_error: OSError | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await site.start()
+            health.http_ok = True
+            log.info("HTTP server bound successfully on port %s", config.health_port)
+            break
+        except OSError as exc:
+            last_bind_error = exc
+            if attempt >= max_attempts:
+                break
+            delay = min(2.0, 1.0 * (2 ** (attempt - 1)))
+            log.warning(
+                "Retrying HTTP bind (attempt %s/%s)...",
+                attempt + 1,
+                max_attempts,
+            )
+            await asyncio.sleep(delay)
+    else:  # pragma: no cover - loop always breaks on success or final failure
+        last_bind_error = OSError("HTTP bind retry loop exhausted")
+
+    if not health.http_ok:
+        assert last_bind_error is not None
+        await capture("HEALTH", last_bind_error, "bind HTTP port")
         await runner.cleanup()
+        log.warning(
+            "WARNING: Could not bind health/webhook port after retries – "
+            "continuing without HTTP server"
+        )
         if external_url:
-            raise RuntimeError(f"Could not bind HTTP port {config.health_port}") from exc
-        return None, None
+            # Keep Render webhook mode alive, but do not pretend the webhook is
+            # active when the HTTP listener could not be started. Telegram will
+            # remain unavailable until a subsequent successful deployment.
+            return None, webhook_url
+        raise RuntimeError(f"Could not bind HTTP port {config.health_port}") from last_bind_error
 
     if webhook_url:
         await bot.set_webhook(
@@ -4652,11 +4788,13 @@ async def main() -> None:
             log.info("Running in polling mode")
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        if webhook_url:
-            try:
-                await bot.delete_webhook(drop_pending_updates=False)
-            except Exception as exc:  # noqa: BLE001
-                await capture("WEBHOOK", exc, "delete webhook")
+        # Always clear any Telegram webhook, including when HTTP binding failed
+        # before start_http_server could return normally. This keeps shutdown
+        # safe across Render redeploys and local polling runs.
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+        except Exception as exc:  # noqa: BLE001
+            await capture("WEBHOOK", exc, "delete webhook")
         if http_runner is not None:
             await http_runner.cleanup()
         await scheduler.stop()
