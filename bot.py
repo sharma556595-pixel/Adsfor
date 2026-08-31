@@ -4,6 +4,7 @@ import asyncio
 import csv
 from dataclasses import dataclass
 import functools
+import hashlib
 import html
 import io
 import json
@@ -81,7 +82,7 @@ class Config:
             owner_ids=owners,
             db_path=db_path,
             backup_dir=backup_dir,
-            health_port=int(os.getenv("HEALTH_PORT", "8080")),
+            health_port=int(os.getenv("PORT", os.getenv("HEALTH_PORT", "8080"))),
             broadcast_rate=int(os.getenv("BROADCAST_RATE", "25")),
             state_ttl=int(os.getenv("ADMIN_STATE_TTL", "600")),
             timezone=os.getenv("TIMEZONE", "UTC"),
@@ -1171,14 +1172,44 @@ class Stats:
 
 DIV = "━━━━━━━━━━━━━━━━━━━━"
 
-# Telegram inline keyboards have no colour API, so a button "style" is
-# expressed with a leading marker. The vocabulary stays consistent panel-wide.
+# Telegram Bot API 9.4+ supports real inline-button styles.
+# DEFAULT means "no explicit style"; the other three map to Telegram's
+# native primary (blue), success (green), and danger (red) styles.
 STYLE_MARK = {
     "PRIMARY": "🔵",
     "SUCCESS": "🟢",
     "DANGER": "🔴",
     "DEFAULT": "",
 }
+STYLE_API = {
+    "PRIMARY": "primary",
+    "SUCCESS": "success",
+    "DANGER": "danger",
+    "DEFAULT": None,
+}
+
+def normalize_style(style: str | None) -> str | None:
+    value = str(style or "DEFAULT").upper()
+    return STYLE_API.get(value, None)
+
+def infer_style(text: str = "", data: str = "") -> str | None:
+    """Choose a native Telegram button colour for hard-coded buttons.
+
+    Explicit styles from the database always win; this fallback keeps the
+    entire panel coloured even for buttons that were not created in the CMS.
+    """
+    t = (text or "").lower()
+    d = (data or "").lower()
+    danger_words = ("delete", "remove", "block", "disable", "danger", "clear",
+                    "cancel", "confirm_del", "clear_all", "stop", "reset")
+    success_words = ("enable", "save", "add", "apply", "confirm", "verify",
+                     "joined", "send", "broadcast", "run", "test", "claim",
+                     "continue", "activate")
+    if any(w in t or w in d for w in danger_words):
+        return "danger"
+    if any(w in t or w in d for w in success_words):
+        return "success"
+    return "primary"
 
 
 # --------------------------------------------------------------------------
@@ -1262,7 +1293,7 @@ def uptime(seconds: float) -> str:
 
 
 def ago(stamp: str | None) -> str:
-    from core.db import now_dt, parse_ts
+    
 
     dt = parse_ts(stamp)
     if dt is None:
@@ -1305,12 +1336,20 @@ def user_label(row: Any) -> str:
 # keyboards
 # --------------------------------------------------------------------------
 
-def btn(text: str, data: str) -> InlineKeyboardButton:
-    return InlineKeyboardButton(text=text, callback_data=data)
+def btn(text: str, data: str, style: str | None = None) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text=text,
+        callback_data=data,
+        style=normalize_style(style) if style is not None else infer_style(text, data),
+    )
 
 
-def url_btn(text: str, url: str) -> InlineKeyboardButton:
-    return InlineKeyboardButton(text=text, url=url)
+def url_btn(text: str, url: str, style: str | None = None) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text=text,
+        url=url,
+        style=normalize_style(style) if style is not None else infer_style(text, url),
+    )
 
 
 def keyboard(rows: Sequence[Sequence[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
@@ -1664,11 +1703,10 @@ async def build_keyboard(screen: str, extra_rows: list[list[InlineKeyboardButton
     for row in rows:
         label = decorate(row)
         if row["kind"] == "url" and row["url"]:
-            button = url_btn(label, row["url"])
+            button = url_btn(label, row["url"], row["style"])
         else:
-            button = InlineKeyboardButton(
-                text=label, callback_data=row["callback"] or "flow:noop"
-            )
+            callback = row["callback"] or "flow:noop"
+            button = btn(label, callback, row["style"])
         grouped.setdefault(int(row["row"]), []).append(button)
     keyboard = [grouped[k] for k in sorted(grouped)]
     if extra_rows:
@@ -1718,8 +1756,8 @@ async def join_keyboard(channels: list[Any], verify_cb: str = "flow:verify"
     rows: list[list[InlineKeyboardButton]] = []
     for channel in channels:
         link = channel["invite_link"] or f"https://t.me/{str(channel['chat_id']).lstrip('@')}"
-        rows.append([url_btn(f"📢 {channel['title']}", link)])
-    rows.append([InlineKeyboardButton(text="✅ I Joined", callback_data=verify_cb)])
+        rows.append([url_btn(f"📢 {channel['title']}", link, "PRIMARY")])
+    rows.append([btn("✅ I Joined", verify_cb, "SUCCESS")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1775,10 +1813,9 @@ def markup_from_json(raw: str | None) -> InlineKeyboardMarkup | None:
         for item in row:
             text = item.get("text") or "Open"
             if item.get("url"):
-                built.append(InlineKeyboardButton(text=text, url=item["url"]))
+                built.append(url_btn(text, item["url"], item.get("style")))
             elif item.get("callback"):
-                built.append(InlineKeyboardButton(text=text,
-                                                  callback_data=item["callback"]))
+                built.append(btn(text, item["callback"], item.get("style")))
         if built:
             rows.append(built)
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
@@ -2192,7 +2229,7 @@ async def cb_stats(call: CallbackQuery, actor: Actor, **_) -> None:
     _, _, args = parse_cb(call.data)
     period = args[0] if args else "today"
     data = await Stats.analytics(period)
-    from core.db import Referrals
+    
 
     top = await Referrals.top(5)
     clicks, claims = data["claim_clicks"], data["claim_success"]
@@ -2290,7 +2327,7 @@ async def cb_controls(call: CallbackQuery, actor: Actor, **_) -> None:
         await audit(actor, "Enabled bot")
         note = "🟢 Bot enabled"
     elif action == "confirm_disable":
-        from core.ui import confirm_screen
+        
 
         text, markup = confirm_screen(
             "Disable the bot?",
@@ -2311,7 +2348,7 @@ async def cb_controls(call: CallbackQuery, actor: Actor, **_) -> None:
         await audit(actor, "Reloaded configuration")
         note = "🔄 Configuration reloaded"
     elif action == "cleartmp":
-        from core.db import Audit
+        
 
         removed = await Audit.cleanup(await settings.number("log_retention_days", 30))
         await audit(actor, "Cleared temporary data", f"{removed} rows")
@@ -2497,7 +2534,7 @@ async def cb_users(call: CallbackQuery, state: FSMContext, actor: Actor, **_) ->
         return
 
     if action == "activity":
-        from core.db import db
+        
 
         rows = await db.fetchall(
             "SELECT event, created_at FROM events WHERE tg_id=?"
@@ -2541,7 +2578,7 @@ async def do_direct_message(message: Message, state: FSMContext, bot: Bot,
         await audit(actor, "Messaged user", str(target))
         note = f"✅ Delivered to <code>{target}</code>"
     except Exception as exc:  # noqa: BLE001
-        from core.security import capture
+        
 
         await capture("ADMIN_DM", exc, f"send to {target}")
         note = f"❌ Could not deliver to <code>{target}</code>"
@@ -2837,7 +2874,7 @@ async def cb_channels(call: CallbackQuery, state: FSMContext, bot: Bot,
         row = await Channels.get(cid)
         me = await bot.get_me()
         ok, detail = await test_channel(bot, row["chat_id"], me.id)
-        from core.db import now
+        
 
         await Channels.update(cid, last_check=now(),
                               last_result="ok" if ok else "failed")
@@ -2886,7 +2923,7 @@ async def do_add_channel(message: Message, state: FSMContext, bot: Bot,
     try:
         chat = await bot.get_chat(raw)
     except Exception as exc:  # noqa: BLE001
-        from core.security import capture
+        
 
         await capture("CHANNEL", exc, f"get_chat {raw}")
         await show(message, screen("➕ ADD CHANNEL", [
@@ -4139,8 +4176,8 @@ async def cb_errors(call: CallbackQuery, actor: Actor, **_) -> None:
 async def cb_cancel(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     state_clock.clear(call.from_user.id)
-    from handlers.admin_dashboard import dashboard_screen
-    from core.security import resolve
+    
+    
 
     actor = await resolve(call.from_user.id)
     if actor is None:
@@ -4477,31 +4514,80 @@ def build_broadcast_hook(bot: Bot):
 # health endpoint (optional)
 # --------------------------------------------------------------------------
 
-async def start_health_server() -> None:
+async def start_http_server(bot: Bot, dp: Dispatcher):
+    """Start Render health/webhook HTTP service.
+
+    Render deployments can briefly overlap old/new instances. Polling uses a
+    single getUpdates consumer, so overlapping instances cause Telegram's
+    409 Conflict. On Render we therefore use a webhook instead of polling.
+    Local/non-Render runs continue to use polling in ``main``.
+    """
     try:
         from aiohttp import web
-    except ModuleNotFoundError:
-        log.info("aiohttp not installed - health endpoint disabled")
-        return
+    except ModuleNotFoundError as exc:
+        if os.getenv("RENDER_EXTERNAL_URL"):
+            raise RuntimeError("aiohttp is required for Render webhook mode") from exc
+        log.info("aiohttp not installed - HTTP service disabled")
+        return None, None
 
-    async def handle(_request):
+    external_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    webhook_url = f"{external_url}/telegram/webhook" if external_url else None
+    secret = hashlib.sha256(config.bot_token.encode("utf-8")).hexdigest()[:64]
+
+    async def handle_health(_request):
         return web.json_response({
             "status": "ok" if await db.ping() else "degraded",
             "uptime_seconds": int(health.uptime),
             "broadcast_running": engine.busy,
+            "webhook": bool(webhook_url),
         })
 
+    async def handle_webhook(request):
+        if not webhook_url:
+            return web.Response(status=404)
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
+            return web.Response(status=403, text="Forbidden")
+        try:
+            payload = await request.json()
+            from aiogram.types import Update
+            update = Update.model_validate(payload)
+            await dp.feed_update(bot, update)
+            return web.Response(text="OK")
+        except Exception as exc:  # noqa: BLE001
+            await capture("WEBHOOK", exc, "feed_update")
+            return web.Response(status=500, text="Update processing failed")
+
     app = web.Application()
-    app.router.add_get("/health", handle)
+    app.router.add_get("/health", handle_health)
+    if webhook_url:
+        app.router.add_post("/telegram/webhook", handle_webhook)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", config.health_port)
     try:
         await site.start()
         health.http_ok = True
-        log.info("Health endpoint listening on :%s/health", config.health_port)
+        log.info("HTTP service listening on :%s", config.health_port)
     except OSError as exc:
-        await capture("HEALTH", exc, "bind health port")
+        await capture("HEALTH", exc, "bind HTTP port")
+        await runner.cleanup()
+        if external_url:
+            raise RuntimeError(f"Could not bind HTTP port {config.health_port}") from exc
+        return None, None
+
+    if webhook_url:
+        await bot.set_webhook(
+            url=webhook_url,
+            secret_token=secret,
+            allowed_updates=dp.resolve_used_update_types(),
+            drop_pending_updates=False,
+        )
+        info = await bot.get_webhook_info()
+        log.info("Telegram webhook active: %s (pending=%s)",
+                 info.url, info.pending_update_count)
+
+    return runner, webhook_url
 
 
 # --------------------------------------------------------------------------
@@ -4550,15 +4636,32 @@ async def main() -> None:
     engine.bind(bot)
     engine.on_finished = build_broadcast_hook(bot)
     scheduler.start(bot)
-    await start_health_server()
 
     dp = build_dispatcher()
+    http_runner = None
+    webhook_url = None
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        http_runner, webhook_url = await start_http_server(bot, dp)
+        if webhook_url:
+            # Render uses webhook mode, so overlapping deploys never compete
+            # for getUpdates. Keep the process alive while aiohttp receives
+            # Telegram updates.
+            log.info("Running in Render webhook mode")
+            await asyncio.Event().wait()
+        else:
+            log.info("Running in polling mode")
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        if webhook_url:
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+            except Exception as exc:  # noqa: BLE001
+                await capture("WEBHOOK", exc, "delete webhook")
+        if http_runner is not None:
+            await http_runner.cleanup()
         await scheduler.stop()
-        await db.close()
         await bot.session.close()
+        await db.close()
 
 
 if __name__ == "__main__":
