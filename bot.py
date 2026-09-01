@@ -6331,21 +6331,36 @@ async def error_handler(
 async def post_init(
     application,
 ):
-    bot = await application.bot.get_me()
+    """Run non-fatal Telegram startup configuration.
 
-    # Keep the normal user command menu clean: only /start is exposed.
-    # /admin and /cancel remain valid handlers for administrators.
+    IMPORTANT: application.bot is a telegram.Bot.
+    bot.get_me() returns telegram.User and must NEVER be used for Bot API
+    methods such as set_my_commands().
+    """
+    telegram_bot = application.bot
+
     try:
-        await bot.set_my_commands([
-            BotCommand("start", "Start the bot"),
-        ])
-    except TelegramError:
-        logger.exception("Could not configure bot command menu")
+        me = await telegram_bot.get_me()
+        logger.info(
+            "Bot connected successfully as @%s (id=%s)",
+            me.username,
+            me.id,
+        )
+    except Exception:
+        logger.exception("Telegram getMe failed during startup")
 
-    logger.info(
-        "Bot started successfully as @%s",
-        bot.username,
-    )
+    # Keep the visible Telegram command menu limited to /start.
+    # /admin and /cancel remain registered handlers but are intentionally
+    # not exposed in the normal command menu. This call is non-fatal.
+    try:
+        await telegram_bot.set_my_commands(
+            commands=[BotCommand("start", "Start the bot")]
+        )
+        logger.info("Telegram command menu configured: /start only")
+    except Exception:
+        logger.exception(
+            "Could not configure Telegram command menu; continuing startup"
+        )
 
 
 async def post_shutdown(
