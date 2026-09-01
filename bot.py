@@ -20,6 +20,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
     InputFile,
     MessageEntity,
 )
@@ -37,6 +38,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ChatJoinRequestHandler,
     ContextTypes,
     filters,
 )
@@ -1307,35 +1309,81 @@ def required_channels():
     )
 
 
-def channel_keyboard():
+def channel_keyboard(channels=None):
+    """Build the join/verify keyboard. When *channels* is supplied, show only those channels."""
+    channels = list(channels) if channels is not None else list(required_channels())
     rows = []
-    for channel in required_channels():
+    for channel in channels:
         url = channel_join_url(channel)
         if url:
-            rows.append([create_button(channel["join_text"], "URL", url=url, style=normalize_style(channel["style"]))])
+            rows.append([
+                create_button(
+                    channel["join_text"],
+                    "URL",
+                    url=url,
+                    style=normalize_style(channel["style"]),
+                )
+            ])
         else:
             logger.error("Enabled channel %s has no usable join URL", channel["id"])
-            rows.append([create_button("⚠️ Channel unavailable", "CALLBACK", callback=f"channel_config_error:{channel['id']}", style="danger")])
-    rows.extend(keyboard_from_scope("start"))
-    rows.append([create_button("✅ VERIFY", "CALLBACK", callback="verify", style="success")])
+            rows.append([
+                create_button(
+                    "⚠️ Channel unavailable",
+                    "CALLBACK",
+                    callback=f"channel_config_error:{channel['id']}",
+                    style="danger",
+                )
+            ])
+    rows.append([
+        create_button("✅ VERIFY", "CALLBACK", callback="verify", style="success")
+    ])
     return InlineKeyboardMarkup(rows)
 
 
+def membership_is_confirmed(member):
+    status = getattr(member, "status", "")
+    is_member = getattr(member, "is_member", None)
+    # Telegram may return restricted members. They are members unless is_member is explicitly False.
+    return status in {"member", "administrator", "creator"} or (
+        status == "restricted" and is_member is not False
+    )
+
+
 async def check_channel_membership(bot, user_id):
+    """Return (missing_channels, check_errors). Errors never masquerade as missing membership."""
     missing = []
     errors = []
     for channel in required_channels():
         try:
-            member = await bot.get_chat_member(chat_id=channel["channel_id"], user_id=user_id)
-            status = getattr(member, "status", "")
-            is_member = getattr(member, "is_member", None)
-            if status in {"left", "kicked"} or (status == "restricted" and is_member is False):
+            member = await bot.get_chat_member(
+                chat_id=channel["channel_id"],
+                user_id=user_id,
+            )
+            if not membership_is_confirmed(member):
                 missing.append(channel)
         except RetryAfter as exc:
             errors.append((channel, f"RetryAfter: {exc.retry_after}"))
         except (Forbidden, BadRequest, NetworkError, TimedOut, TelegramError) as exc:
             errors.append((channel, str(exc)))
     return missing, errors
+
+
+async def auto_approve_join_request(update, context):
+    """Auto-approve required-channel join requests so users can verify immediately."""
+    request = update.chat_join_request
+    chat_id = request.chat.id
+    user_id = request.from_user.id
+    row = db_one(
+        "SELECT id FROM channels WHERE enabled=1 AND channel_id=?",
+        (str(chat_id),),
+    )
+    if not row:
+        return
+    try:
+        await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
+        logger.info("Auto-approved join request: user=%s channel=%s", user_id, chat_id)
+    except (BadRequest, Forbidden, TelegramError) as exc:
+        logger.warning("Could not auto-approve join request: user=%s channel=%s error=%s", user_id, chat_id, exc)
 
 
 # ============================================================
@@ -1716,47 +1764,39 @@ async def verify_callback(
         )
     )
 
-    if missing or errors:
+    if errors:
+        # A transient/permission/network error is not proof that the user failed to join.
+        DB.execute("UPDATE users SET verified=0, last_activity=? WHERE id=?", (utc_now(), user_id))
+        DB.commit()
+        await answer_callback(
+            query,
+            "Telegram could not check all channels. Please tap VERIFY again.",
+            True,
+        )
+        return
+
+    if missing:
         DB.execute("UPDATE users SET verified=0, last_activity=? WHERE id=?", (utc_now(), user_id))
         DB.commit()
 
-        names = "\n".join(
-            f"• {channel['title']}"
-            for channel in missing
-        )
-
-        if not names:
-            names = (
-                "• Some channels could not "
-                "be verified."
-            )
-
-        join_message = render_template(
-            get_message("join")["text"],
-            user_id,
-        )
-
-        text = (
-            join_message
-            + "\n\n"
-            + names
-        )
+        names = "\n".join(f"• {channel['title']}" for channel in missing)
+        join_message = render_template(get_message("join")["text"], user_id)
+        text = join_message + "\n\n❗ Still required:\n" + names
 
         try:
             await query.message.edit_text(
                 text=text,
-                reply_markup=channel_keyboard(),
+                reply_markup=channel_keyboard(missing),
             )
         except TelegramError:
             try:
                 await context.bot.send_message(
                     user_id,
                     text,
-                    reply_markup=channel_keyboard(),
+                    reply_markup=channel_keyboard(missing),
                 )
             except TelegramError:
                 pass
-
         return
 
     DB.execute(
@@ -6293,6 +6333,15 @@ async def post_init(
 ):
     bot = await application.bot.get_me()
 
+    # Keep the normal user command menu clean: only /start is exposed.
+    # /admin and /cancel remain valid handlers for administrators.
+    try:
+        await bot.set_my_commands([
+            BotCommand("start", "Start the bot"),
+        ])
+    except TelegramError:
+        logger.exception("Could not configure bot command menu")
+
     logger.info(
         "Bot started successfully as @%s",
         bot.username,
@@ -6349,6 +6398,13 @@ def build_application():
         CommandHandler(
             "cancel",
             cancel_command,
+        )
+    )
+
+    # Required for channels/groups that use join requests.
+    application.add_handler(
+        ChatJoinRequestHandler(
+            auto_approve_join_request,
         )
     )
 
