@@ -338,6 +338,9 @@ DEFAULT_SETTINGS = {
     "stats_show_agent": "1",
     "stats_show_status": "1",
     "stats_show_dates": "1",
+
+    "auto_accept_enabled": "1",
+    "notify_channel_id": "",
 }
 
 
@@ -901,17 +904,31 @@ def render_template_with_entities(text, entities, user_id=None, extra=None):
     adjusted = []
     for entity in entities:
         try:
-            data = entity.to_dict()
-            old_start_u16 = int(data.get("offset", 0))
-            old_len_u16 = int(data.get("length", 0))
+            old_start_u16 = entity.offset
+            old_len_u16 = entity.length
             old_end_u16 = old_start_u16 + old_len_u16
             start_py = py_index_from_u16(old_start_u16)
             end_py = py_index_from_u16(old_end_u16)
             new_start = boundary[max(0, min(len(text), start_py))]
             new_end = boundary[max(0, min(len(text), end_py))]
-            data["offset"] = new_start
-            data["length"] = max(0, new_end - new_start)
-            adjusted.append(MessageEntity.de_json(data, None))
+
+            # Rebuild the entity directly instead of round-tripping through
+            # to_dict()/de_json(). de_json(data, bot=None) is not guaranteed
+            # across PTB versions to preserve fields like custom_emoji_id or
+            # language once bot=None is passed, which was silently downgrading
+            # premium/custom emoji to plain emoji on render. Copying every
+            # field manually means nothing Telegram cares about can be lost.
+            adjusted.append(
+                MessageEntity(
+                    type=entity.type,
+                    offset=new_start,
+                    length=max(0, new_end - new_start),
+                    url=entity.url,
+                    user=entity.user,
+                    language=entity.language,
+                    custom_emoji_id=entity.custom_emoji_id,
+                )
+            )
         except Exception:
             logger.exception("Failed to adjust message entity")
             adjusted.append(entity)
@@ -1368,8 +1385,51 @@ async def check_channel_membership(bot, user_id):
     return missing, errors
 
 
+async def notify_admin_new_user(context, user):
+    """Send a new-user alert to the configured notification channel, if set."""
+    channel_id = get_setting("notify_channel_id", "").strip()
+    if not channel_id:
+        return
+
+    username = f"@{user.username}" if user.username else "—"
+    full_name = html.escape(
+        " ".join(
+            part
+            for part in [user.first_name, user.last_name]
+            if part
+        )
+        or "—"
+    )
+
+    text = (
+        "🆕 One more user came on your bot!\n\n"
+        f"👤 Name: {full_name}\n"
+        f"🔖 Username: {html.escape(username)}\n"
+        f"🆔 ID: <code>{user.id}</code>"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=channel_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as exc:
+        logger.warning(
+            "Could not send new-user notification to %s: %s",
+            channel_id,
+            exc,
+        )
+
+
 async def auto_approve_join_request(update, context):
-    """Auto-approve required-channel join requests so users can verify immediately."""
+    """Auto-approve required-channel join requests so users can verify immediately.
+
+    Controlled by the admin panel's Auto-Accept toggle (settings.auto_accept_enabled).
+    When off, join requests are left pending for manual admin approval.
+    """
+    if get_setting("auto_accept_enabled", "1") != "1":
+        return
     request = update.chat_join_request
     chat_id = request.chat.id
     user_id = request.from_user.id
@@ -1671,10 +1731,16 @@ async def start_command(
                 None,
             )
 
-    register_user(
+    is_new_user = register_user(
         update.effective_user,
         referral_id,
     )
+
+    if is_new_user:
+        await notify_admin_new_user(
+            context,
+            update.effective_user,
+        )
 
     if maintenance_enabled_for(
         user_id
@@ -2175,6 +2241,9 @@ def admin_keyboard():
         ("👑 Admins", "adm:admins"),
 
         ("🧹 Cleanup", "adm:cleanup"),
+        ("✅ Auto-Accept", "adm:autoaccept"),
+
+        ("🎨 Button Colors", "adm:colors"),
     ]
 
     rows = []
@@ -2365,6 +2434,138 @@ async def admin_callback_router(
         elif data == "adm:channel_health":
             await admin_channel_health(update, context)
 
+        elif data.startswith("adm:chcolor:"):
+            style = data.split(":", 2)[2] or None
+
+            wizard = context.user_data.get("channel_wizard_data")
+
+            if (
+                context.user_data.get("state") != "channel_wizard"
+                or not wizard
+                or not wizard.get("channel_id")
+            ):
+                await edit_admin_message(
+                    update,
+                    "❌ Channel wizard session expired. Start again from Channels.",
+                    admin_keyboard(),
+                )
+            else:
+                try:
+                    config = validate_channel_input(
+                        wizard.get("title"),
+                        wizard.get("channel_id"),
+                        wizard.get("username"),
+                        wizard.get("invite_link"),
+                        wizard.get("join_text", "JOIN"),
+                        style,
+                    )
+
+                    editing_id = context.user_data.get("channel_wizard_editing")
+
+                    duplicate = db_one(
+                        "SELECT id FROM channels WHERE id != ? AND "
+                        "(channel_id=? OR (username IS NOT NULL AND username=?) "
+                        "OR (invite_link IS NOT NULL AND invite_link=?))",
+                        (
+                            editing_id or 0,
+                            config["channel_id"],
+                            config["username"],
+                            config["invite_link"],
+                        ),
+                    )
+
+                    if duplicate:
+                        await edit_admin_message(
+                            update,
+                            "❌ A channel with this ID, username or invite "
+                            "link already exists.",
+                            admin_keyboard(),
+                        )
+                    else:
+                        await validate_channel_with_telegram(context.bot, config)
+
+                        if editing_id:
+                            row = db_one(
+                                "SELECT position FROM channels WHERE id=?",
+                                (editing_id,),
+                            )
+                            position = row["position"] if row else 0
+                            with transaction():
+                                DB.execute(
+                                    "UPDATE channels SET title=?, channel_id=?, "
+                                    "username=?, invite_link=?, join_text=?, "
+                                    "style=?, position=? WHERE id=?",
+                                    (
+                                        config["title"],
+                                        config["channel_id"],
+                                        config["username"],
+                                        config["invite_link"],
+                                        config["join_text"],
+                                        config["style"],
+                                        position,
+                                        editing_id,
+                                    ),
+                                )
+                            log_action(user_id, "edit_channel", str(editing_id))
+                            result_text = "✅ Channel updated."
+                        else:
+                            position = db_one(
+                                "SELECT COALESCE(MAX(position), -1) + 1 AS p FROM channels"
+                            )["p"]
+                            with transaction():
+                                DB.execute(
+                                    "INSERT INTO channels(title, channel_id, "
+                                    "username, invite_link, join_text, style, "
+                                    "position) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                                    (
+                                        config["title"],
+                                        config["channel_id"],
+                                        config["username"],
+                                        config["invite_link"],
+                                        config["join_text"],
+                                        config["style"],
+                                        position,
+                                    ),
+                                )
+                            log_action(user_id, "add_channel", config["channel_id"])
+                            result_text = "✅ Channel added."
+
+                        context.user_data.clear()
+                        await edit_admin_message(update, result_text, admin_keyboard())
+
+                except ValueError as exc:
+                    context.user_data.clear()
+                    await edit_admin_message(
+                        update,
+                        f"❌ CHANNEL VALIDATION FAILED\n\n{exc}",
+                        admin_keyboard(),
+                    )
+                except sqlite3.Error:
+                    logger.exception("Channel wizard save failed")
+                    context.user_data.clear()
+                    await edit_admin_message(
+                        update,
+                        "❌ Channel could not be saved. No partial data was stored.",
+                        admin_keyboard(),
+                    )
+
+        elif data == "adm:bcbtn_add":
+            if context.user_data.get("broadcast") is None:
+                await query.message.reply_text("❌ Broadcast session expired. /cancel and start again.")
+            else:
+                context.user_data["state"] = "broadcast_button_text"
+                await query.message.reply_text(
+                    "🔗 Send the button's label text (max 64 characters).\n\n"
+                    "/cancel to cancel."
+                )
+
+        elif data == "adm:bcbtn_skip":
+            if context.user_data.get("broadcast") is None:
+                await query.message.reply_text("❌ Broadcast session expired. /cancel and start again.")
+            else:
+                context.user_data["state"] = "broadcast"
+                await send_broadcast_preview(query, context)
+
         elif data.startswith(
             "adm:msgedit:"
         ):
@@ -2445,6 +2646,63 @@ async def admin_callback_router(
             await admin_maintenance(
                 update,
                 context,
+            )
+
+        elif data == "adm:autoaccept":
+            await admin_autoaccept(
+                update,
+                context,
+            )
+
+        elif data == "adm:toggle_autoaccept":
+            current = get_setting(
+                "auto_accept_enabled",
+                "1",
+            )
+
+            set_setting(
+                "auto_accept_enabled",
+                "0"
+                if current == "1"
+                else "1",
+            )
+
+            DB.commit()
+
+            log_action(
+                user_id,
+                "autoaccept_toggle",
+                get_setting(
+                    "auto_accept_enabled"
+                ),
+            )
+
+            await admin_autoaccept(
+                update,
+                context,
+            )
+
+        elif data == "adm:colors":
+            await admin_colors(
+                update,
+                context,
+            )
+
+        elif data == "adm:noop":
+            await answer_callback(query)
+
+        elif data.startswith("adm:cyclechcolor:"):
+            await admin_cycle_channel_color(
+                update,
+                context,
+                safe_int(data.split(":")[-1], 0),
+            )
+
+        elif data.startswith("adm:cyclebtncolor:"):
+            await admin_cycle_button_color(
+                update,
+                context,
+                safe_int(data.split(":")[-1], 0),
             )
 
         elif data == "adm:settings":
@@ -4362,6 +4620,73 @@ async def admin_setting_edit(
 
 
 # ============================================================
+# AUTO-ACCEPT (JOIN REQUEST AUTO-APPROVAL)
+# ============================================================
+
+async def admin_autoaccept(
+    update,
+    context,
+):
+    enabled = (
+        get_setting(
+            "auto_accept_enabled",
+            "1",
+        )
+        == "1"
+    )
+
+    status = (
+        "ON 🟢"
+        if enabled
+        else "OFF 🔴"
+    )
+
+    notify_channel = get_setting(
+        "notify_channel_id",
+        "",
+    ).strip()
+
+    await edit_admin_message(
+        update,
+        "✅ AUTO-ACCEPT JOIN REQUESTS\n\n"
+        f"Status: {status}\n\n"
+        "When ON, users who send a join request to any "
+        "enabled required channel are approved instantly "
+        "so they can verify right away.\n\n"
+        "When OFF, join requests stay pending until an "
+        "admin approves them manually inside Telegram.\n\n"
+        f"📢 New-user alert channel: "
+        f"{notify_channel or 'not set'}",
+        InlineKeyboardMarkup(
+            [
+                [
+                    create_button(
+                        "Toggle Auto-Accept",
+                        "CALLBACK",
+                        callback="adm:toggle_autoaccept",
+                        style="danger" if enabled else "success",
+                    )
+                ],
+                [
+                    create_button(
+                        "📢 Set Notify Channel",
+                        "CALLBACK",
+                        callback="adm:setting:notify_channel_id",
+                    )
+                ],
+                [
+                    create_button(
+                        "⬅️ Admin",
+                        "CALLBACK",
+                        callback="adm:dash",
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+# ============================================================
 # MAINTENANCE
 # ============================================================
 
@@ -4571,11 +4896,71 @@ async def admin_cleanup(
 # ADMIN ADD FLOWS
 # ============================================================
 
+async def start_channel_wizard(
+    update,
+    context,
+    channel_row_id=None,
+):
+    """Begin the step-by-step channel add/edit wizard.
+
+    channel_row_id is None for a brand new channel, or the DB row id when
+    editing an existing one (pre-fills fields, wizard still walks through
+    each step so the color picker stays available).
+    """
+    context.user_data.clear()
+
+    context.user_data["state"] = "channel_wizard"
+    context.user_data["channel_wizard_step"] = "id"
+    context.user_data["channel_wizard_editing"] = channel_row_id
+    context.user_data["channel_wizard_data"] = {}
+
+    await edit_admin_message(
+        update,
+        "📣 ADD CHANNEL — Step 1/4\n\n"
+        "Send the Channel ID.\n\n"
+        "This looks like -1001234567890. Forward any "
+        "message from the channel to @userinfobot or "
+        "@RawDataBot to find it if you don't have it.\n\n"
+        "/cancel to cancel.",
+    )
+
+
+CHANNEL_COLOR_OPTIONS = [
+    ("🔵 Primary", "primary"),
+    ("🟢 Success", "success"),
+    ("🔴 Danger", "danger"),
+    ("⚪ Default", ""),
+]
+
+
+def channel_wizard_color_keyboard():
+    rows = []
+    for label, style in CHANNEL_COLOR_OPTIONS:
+        rows.append(
+            [
+                create_button(
+                    label,
+                    "CALLBACK",
+                    callback=f"adm:chcolor:{style}",
+                    style=style or None,
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
 async def admin_add_flow(
     update,
     context,
     kind,
 ):
+    if kind == "channel":
+        await start_channel_wizard(
+            update,
+            context,
+        )
+        return
+
     context.user_data[
         "state"
     ] = "add"
@@ -4585,13 +4970,6 @@ async def admin_add_flow(
     ] = kind
 
     prompts = {
-
-        "channel":
-            "📣 Add Channel\n\n"
-            "Send:\n"
-            "Title | Channel ID | @username | invite URL\n\n"
-            "Example:\n"
-            "Official Channel | -100123456789 | @example | https://t.me/example",
 
         "number":
             "📱 Send one WhatsApp number.\n\n"
@@ -4850,6 +5228,150 @@ async def admin_toggle_channel(
     )
 
 
+# ============================================================
+# UNIFIED BUTTON COLOR EDITOR
+# ============================================================
+
+COLOR_CYCLE = ["primary", "success", "danger", ""]
+
+
+def _next_color(current):
+    current = current or ""
+    try:
+        idx = COLOR_CYCLE.index(current)
+    except ValueError:
+        idx = -1
+    return COLOR_CYCLE[(idx + 1) % len(COLOR_CYCLE)]
+
+
+def _color_label(style):
+    return {
+        "primary": "🔵 Primary",
+        "success": "🟢 Success",
+        "danger": "🔴 Danger",
+        "": "⚪ Default",
+    }.get(style or "", "⚪ Default")
+
+
+async def admin_colors(
+    update,
+    context,
+):
+    channels = db_all(
+        "SELECT id, title, join_text, style FROM channels ORDER BY position, id"
+    )
+    buttons = db_all(
+        "SELECT id, text, scope, style FROM buttons ORDER BY scope, row, position, id"
+    )
+
+    rows = []
+
+    if channels:
+        rows.append(
+            [
+                create_button(
+                    "— CHANNEL JOIN BUTTONS —",
+                    "CALLBACK",
+                    callback="adm:noop",
+                )
+            ]
+        )
+        for channel in channels:
+            rows.append(
+                [
+                    create_button(
+                        f"{channel['title'][:18]} ({channel['join_text']})",
+                        "CALLBACK",
+                        callback="adm:noop",
+                    ),
+                    create_button(
+                        _color_label(channel["style"]),
+                        "CALLBACK",
+                        callback=f"adm:cyclechcolor:{channel['id']}",
+                        style=channel["style"] or None,
+                    ),
+                ]
+            )
+
+    if buttons:
+        rows.append(
+            [
+                create_button(
+                    "— CUSTOM BUTTONS —",
+                    "CALLBACK",
+                    callback="adm:noop",
+                )
+            ]
+        )
+        for button in buttons:
+            rows.append(
+                [
+                    create_button(
+                        f"[{button['scope']}] {button['text'][:16]}",
+                        "CALLBACK",
+                        callback="adm:noop",
+                    ),
+                    create_button(
+                        _color_label(button["style"]),
+                        "CALLBACK",
+                        callback=f"adm:cyclebtncolor:{button['id']}",
+                        style=button["style"] or None,
+                    ),
+                ]
+            )
+
+    rows.append(
+        [
+            create_button(
+                "⬅️ Admin",
+                "CALLBACK",
+                callback="adm:dash",
+            )
+        ]
+    )
+
+    await edit_admin_message(
+        update,
+        "🎨 BUTTON COLORS\n\n"
+        "Tap a color chip to cycle it: "
+        "Primary → Success → Danger → Default.\n\n"
+        + (
+            "No channels or custom buttons configured yet."
+            if not channels and not buttons
+            else ""
+        ),
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def admin_cycle_channel_color(update, context, channel_id):
+    channel = db_one("SELECT style FROM channels WHERE id=?", (channel_id,))
+    if not channel:
+        await admin_colors(update, context)
+        return
+    new_style = _next_color(channel["style"])
+    DB.execute(
+        "UPDATE channels SET style=? WHERE id=?",
+        (new_style or None, channel_id),
+    )
+    DB.commit()
+    await admin_colors(update, context)
+
+
+async def admin_cycle_button_color(update, context, button_id):
+    button = db_one("SELECT style FROM buttons WHERE id=?", (button_id,))
+    if not button:
+        await admin_colors(update, context)
+        return
+    new_style = _next_color(button["style"])
+    DB.execute(
+        "UPDATE buttons SET style=? WHERE id=?",
+        (new_style or None, button_id),
+    )
+    DB.commit()
+    await admin_colors(update, context)
+
+
 async def admin_delete_number(
     update,
     context,
@@ -5030,7 +5552,48 @@ async def handle_broadcast_message(
                     else None
                 )
             ),
+        "buttons": [],
     }
+
+    context.user_data["state"] = "broadcast_button_prompt"
+
+    await message.reply_text(
+        "🔗 Add an inline button under this broadcast?\n\n"
+        "This is separate from the permanent buttons configured "
+        "in Buttons → scope 'broadcast' — it's a one-off link "
+        "just for this message (e.g. a promo or channel link).",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    create_button(
+                        "➕ Add Button",
+                        "CALLBACK",
+                        callback="adm:bcbtn_add",
+                        style="success",
+                    ),
+                    create_button(
+                        "⏭ Skip",
+                        "CALLBACK",
+                        callback="adm:bcbtn_skip",
+                    ),
+                ]
+            ]
+        ),
+    )
+
+    return True
+
+
+async def send_broadcast_preview(update_or_message, context):
+    """Render the broadcast preview screen with confirm/cancel controls.
+
+    Called once the admin has either added their one-off buttons or
+    skipped that step. Accepts either an Update (from a callback) or a
+    Message (from the original text/media capture) so both entry points
+    can share the same preview renderer.
+    """
+    data = context.user_data.get("broadcast") or {}
+    text = data.get("text", "")
 
     total = db_one(
         """
@@ -5040,82 +5603,60 @@ async def handle_broadcast_message(
         """
     )["c"]
 
-    preview_markup = None
-
-    broadcast_buttons = keyboard_from_scope(
-        "broadcast"
-    )
-
-    if broadcast_buttons:
-        preview_markup = (
-            InlineKeyboardMarkup(
-                broadcast_buttons
-            )
-        )
-
-    if preview_markup is None:
-        preview_markup = (
-            InlineKeyboardMarkup(
-                [
-                    [
-                        create_button(
-                            "✅ CONFIRM BROADCAST",
-                            "CALLBACK",
-                            callback="adm:confirm_broadcast:0",
-                            style="success",
-                        ),
-                        create_button(
-                            "❌ CANCEL",
-                            "CALLBACK",
-                            callback="adm:cancel_broadcast",
-                            style="danger",
-                        ),
-                    ]
-                ]
-            )
-        )
-    else:
-        extra_rows = [
+    one_off_rows = []
+    for button in data.get("buttons", []):
+        one_off_rows.append(
             [
                 create_button(
-                    "✅ CONFIRM BROADCAST",
-                    "CALLBACK",
-                    callback="adm:confirm_broadcast:0",
-                    style="success",
-                ),
-                create_button(
-                    "❌ CANCEL",
-                    "CALLBACK",
-                    callback="adm:cancel_broadcast",
-                    style="danger",
-                ),
+                    button["text"],
+                    "URL",
+                    url=button["url"],
+                    style="primary",
+                )
             ]
-        ]
-
-        preview_markup = (
-            InlineKeyboardMarkup(
-                broadcast_buttons
-                + extra_rows
-            )
         )
 
-    try:
+    scope_rows = keyboard_from_scope("broadcast")
 
-        await message.reply_text(
+    control_row = [
+        create_button(
+            "✅ CONFIRM BROADCAST",
+            "CALLBACK",
+            callback="adm:confirm_broadcast:0",
+            style="success",
+        ),
+        create_button(
+            "❌ CANCEL",
+            "CALLBACK",
+            callback="adm:cancel_broadcast",
+            style="danger",
+        ),
+    ]
+
+    preview_markup = InlineKeyboardMarkup(
+        one_off_rows + scope_rows + [control_row]
+    )
+
+    reply_target = (
+        update_or_message.message
+        if hasattr(update_or_message, "message")
+        and update_or_message.message
+        else update_or_message
+    )
+
+    try:
+        await reply_target.reply_text(
             "👁 BROADCAST PREVIEW\n\n"
             f"{text[:3500]}\n\n"
             f"👥 Recipients: {total}",
             reply_markup=preview_markup,
         )
-
     except TelegramError:
-        await message.reply_text(
+        await reply_target.reply_text(
             "👁 Broadcast preview prepared.\n\n"
             f"👥 Recipients: {total}",
             reply_markup=preview_markup,
         )
-
-    return True
 
 
 async def broadcast_confirm(
@@ -5171,7 +5712,10 @@ async def broadcast_confirm(
                 data["entities"],
                 ensure_ascii=False,
             ),
-            json.dumps([]),
+            json.dumps(
+                data.get("buttons", []),
+                ensure_ascii=False,
+            ),
             len(users),
             "running",
         ),
@@ -5201,15 +5745,29 @@ async def broadcast_confirm(
         for entity in data["entities"]
     ]
 
+    one_off_rows = [
+        [
+            create_button(
+                button["text"],
+                "URL",
+                url=button["url"],
+                style="primary",
+            )
+        ]
+        for button in data.get("buttons", [])
+    ]
+
     broadcast_rows = keyboard_from_scope(
         "broadcast"
     )
 
+    combined_rows = one_off_rows + broadcast_rows
+
     broadcast_markup = (
         InlineKeyboardMarkup(
-            broadcast_rows
+            combined_rows
         )
-        if broadcast_rows
+        if combined_rows
         else None
     )
 
@@ -5440,20 +5998,30 @@ async def handle_admin_message(
             "editing_message"
         )
 
+        has_media = bool(
+            message.photo
+            or message.video
+        )
+
         text = (
             message.caption
-            if (
-                message.photo
-                or message.video
-            )
+            if has_media
             else message.text
         )
 
-        if text is None:
+        if text is None and not has_media:
             await message.reply_text(
                 "❌ Send text, photo or video."
             )
             return True
+
+        if text is None and has_media:
+            # Photo/video sent with no caption at all — perfectly valid,
+            # this is exactly how an admin adds a bare image with no text.
+            # Keep whatever text was previously saved for this key instead
+            # of wiping it out or rejecting the upload.
+            existing = get_message(key)
+            text = existing["text"]
 
         media_type = None
         media_file_id = None
@@ -5478,6 +6046,15 @@ async def handle_admin_message(
             )
             else message.entities
         )
+
+        if has_media and message.caption is None:
+            # No fresh caption entities to apply since there's no caption;
+            # keep whatever formatting was already stored for this key.
+            existing = get_message(key)
+            entities = deserialize_entities(
+                existing["entities"],
+                context.bot,
+            )
 
         save_message(
             key,
@@ -5639,51 +6216,6 @@ async def handle_admin_message(
             )
 
         # Channel
-        elif kind == "channel":
-            parts = [item.strip() for item in text.split("|")]
-            try:
-                if len(parts) >= 5:
-                    title, channel_id, join_url, join_text, style = parts[:5]
-                    username = normalize_username(join_url)
-                    invite_link = join_url if re.match(r"^https?://t\.me/(?:\+|joinchat/)", join_url, re.I) else None
-                    config = validate_channel_input(title, channel_id, username, invite_link, join_text, style.lower())
-                elif len(parts) >= 4:
-                    title, channel_id, username, invite_link = parts[:4]
-                    config = validate_channel_input(title, channel_id, username, invite_link)
-                elif len(parts) >= 3:
-                    title, channel_id, join_url = parts[:3]
-                    username = normalize_username(join_url)
-                    invite_link = join_url if re.match(r"^https?://t\.me/(?:\+|joinchat/)", join_url, re.I) else None
-                    config = validate_channel_input(title, channel_id, username, invite_link)
-                else:
-                    raise ValueError("Invalid format.")
-
-                duplicate = db_one(
-                    "SELECT id FROM channels WHERE channel_id=? OR (username IS NOT NULL AND username=? ) OR (invite_link IS NOT NULL AND invite_link=?)",
-                    (config["channel_id"], config["username"], config["invite_link"]),
-                )
-                if duplicate:
-                    await message.reply_text("❌ Channel already exists.")
-                    return True
-
-                await validate_channel_with_telegram(context.bot, config)
-
-                position = db_one("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM channels")["p"]
-                with transaction():
-                    DB.execute(
-                        """INSERT INTO channels(title, channel_id, username, invite_link, join_text, style, position) VALUES(?, ?, ?, ?, ?, ?, ?)""",
-                        (config["title"], config["channel_id"], config["username"], config["invite_link"], config["join_text"], config["style"], position),
-                    )
-                log_action(user_id, "add_channel", config["channel_id"])
-                await message.reply_text("✅ Channel added.", reply_markup=admin_keyboard())
-            except ValueError as exc:
-                await message.reply_text(f"❌ CHANNEL VALIDATION FAILED\n\n{exc}")
-                return True
-            except sqlite3.Error:
-                logger.exception("Channel insert failed")
-                await message.reply_text("❌ Channel could not be saved. No partial data was stored.")
-                return True
-
         # Button
         elif kind == "button":
             parts = [x.strip() for x in text.split("|")]
@@ -5965,24 +6497,24 @@ async def admin_edit_channel_flow(
     if not channel:
         return
 
-    context.user_data[
-        "state"
-    ] = "edit_channel"
+    context.user_data.clear()
 
-    context.user_data[
-        "editing_channel"
-    ] = channel_id
+    context.user_data["state"] = "channel_wizard"
+    context.user_data["channel_wizard_step"] = "id"
+    context.user_data["channel_wizard_editing"] = channel_id
+    context.user_data["channel_wizard_data"] = {
+        "channel_id": channel["channel_id"],
+        "username": channel["username"],
+        "invite_link": channel["invite_link"],
+        "join_text": channel["join_text"],
+        "title": channel["title"],
+    }
 
     await edit_admin_message(
         update,
-        "✏️ EDIT CHANNEL\n\n"
-        "Send:\n"
-        "Title | Channel ID | @username | invite URL\n\n"
-        f"Current:\n"
-        f"{channel['title']} | "
-        f"{channel['channel_id']} | "
-        f"{channel['username'] or ''} | "
-        f"{channel['invite_link'] or ''}\n\n"
+        "✏️ EDIT CHANNEL — Step 1/4\n\n"
+        f"Current Channel ID: {channel['channel_id']}\n\n"
+        "Send a new Channel ID, or /skip to keep the current one.\n\n"
         "/cancel to cancel.",
     )
 
@@ -6005,6 +6537,168 @@ async def handle_extended_admin_state(
     )
 
     message = update.message
+
+    if state == "broadcast_button_text":
+        text_in = (message.text or "").strip()
+        if not text_in:
+            await message.reply_text("❌ Button text cannot be empty. Send it again, or /cancel.")
+            return True
+        if len(text_in) > 64:
+            await message.reply_text("❌ Button text is too long (max 64 characters). Send it again.")
+            return True
+
+        context.user_data["broadcast_pending_button_text"] = text_in
+        context.user_data["state"] = "broadcast_button_url"
+
+        await message.reply_text(
+            "🔗 Now send the URL for this button.\n\n"
+            "Must start with http:// or https://\n\n"
+            "/cancel to cancel."
+        )
+        return True
+
+    if state == "broadcast_button_url":
+        url_in = (message.text or "").strip()
+        if not re.match(r"^https?://[^\s]+$", url_in, re.I):
+            await message.reply_text("❌ Invalid URL. It must start with http:// or https://. Send it again.")
+            return True
+
+        button_text = context.user_data.pop("broadcast_pending_button_text", None)
+        if not button_text:
+            await message.reply_text("❌ Session expired. /cancel and start the broadcast again.")
+            return True
+
+        broadcast_data = context.user_data.setdefault("broadcast", {"buttons": []})
+        broadcast_data.setdefault("buttons", []).append(
+            {"text": button_text, "url": url_in}
+        )
+
+        context.user_data["state"] = "broadcast_button_prompt"
+
+        await message.reply_text(
+            f"✅ Button added: {button_text} → {url_in}\n\n"
+            "Add another button, or continue to preview?",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        create_button(
+                            "➕ Add Another",
+                            "CALLBACK",
+                            callback="adm:bcbtn_add",
+                            style="success",
+                        ),
+                        create_button(
+                            "▶️ Continue",
+                            "CALLBACK",
+                            callback="adm:bcbtn_skip",
+                        ),
+                    ]
+                ]
+            ),
+        )
+        return True
+
+    if state == "channel_wizard":
+        step = context.user_data.get("channel_wizard_step")
+        wizard = context.user_data.setdefault("channel_wizard_data", {})
+        is_editing = bool(context.user_data.get("channel_wizard_editing"))
+        heading = "EDIT CHANNEL" if is_editing else "ADD CHANNEL"
+        text_in = (message.text or "").strip()
+        is_skip = text_in.lower() == "/skip"
+
+        if step == "id":
+            if is_skip and is_editing and wizard.get("channel_id"):
+                pass  # keep existing value already pre-filled in wizard
+            elif not re.fullmatch(r"-100\d{5,15}|-\d{4,20}", text_in):
+                await message.reply_text(
+                    "❌ Invalid Channel ID. It should look like "
+                    "-1001234567890.\n\nSend it again"
+                    + (", /skip to keep current, " if is_editing else " ")
+                    + "or /cancel."
+                )
+                return True
+            else:
+                wizard["channel_id"] = text_in
+
+            context.user_data["channel_wizard_step"] = "link"
+
+            current_link = wizard.get("invite_link") or wizard.get("username") or ""
+            await message.reply_text(
+                f"📣 {heading} — Step 2/4\n\n"
+                "Send the invite link or @username of the channel.\n\n"
+                "Accepted:\n"
+                "@channelusername\n"
+                "https://t.me/channelusername\n"
+                "https://t.me/+xxxxxxxxxxxx (private invite link)\n\n"
+                "If the channel has no public username, send the "
+                "private invite link instead — one is required."
+                + (f"\n\nCurrent: {current_link}\n/skip to keep it." if is_editing and current_link else "")
+                + "\n\n/cancel to cancel."
+            )
+            return True
+
+        if step == "link":
+            if is_skip and is_editing and (wizard.get("username") or wizard.get("invite_link")):
+                pass  # keep existing username/invite_link already pre-filled
+            else:
+                username = normalize_username(text_in)
+                invite_link = (
+                    text_in
+                    if re.match(r"^https?://t\.me/(?:\+|joinchat/)", text_in, re.I)
+                    else None
+                )
+
+                if not username and not invite_link:
+                    await message.reply_text(
+                        "❌ That doesn't look like a valid @username or "
+                        "invite link. Send it again"
+                        + (", /skip to keep current, " if is_editing else " ")
+                        + "or /cancel."
+                    )
+                    return True
+
+                wizard["username"] = username
+                wizard["invite_link"] = invite_link
+
+            context.user_data["channel_wizard_step"] = "title"
+
+            current_title = wizard.get("join_text") or ""
+            await message.reply_text(
+                f"📣 {heading} — Step 3/4\n\n"
+                "What should the join button say?\n\n"
+                "Example: JOIN"
+                + (f"\n\nCurrent: {current_title}\n/skip to keep it." if is_editing and current_title else "")
+                + "\n\n/cancel to cancel."
+            )
+            return True
+
+        if step == "title":
+            if is_skip and is_editing and wizard.get("join_text"):
+                pass  # keep existing title/button text already pre-filled
+            elif not text_in:
+                await message.reply_text("❌ Title/button text cannot be empty. Send it again.")
+                return True
+            else:
+                wizard["join_text"] = text_in
+                # "title" here is the internal channel label shown in the
+                # admin panel list; kept in sync with the button text.
+                wizard["title"] = text_in
+
+            context.user_data["channel_wizard_step"] = "color"
+
+            await message.reply_text(
+                f"📣 {heading} — Step 4/4\n\n"
+                "Pick a color for the join button:",
+                reply_markup=channel_wizard_color_keyboard(),
+            )
+            return True
+
+        # step == "color" is handled entirely via callback buttons
+        # (adm:chcolor:<style>), not free text.
+        await message.reply_text(
+            "Please tap one of the color buttons above, or /cancel."
+        )
+        return True
 
     if state == "edit_button":
         button_id = context.user_data.get("editing_button")
@@ -6042,56 +6736,6 @@ async def handle_extended_admin_state(
         DB.commit()
         context.user_data.clear()
         await message.reply_text("✅ Button updated.", reply_markup=admin_keyboard())
-        return True
-
-    if state == "edit_channel":
-        channel_row_id = context.user_data.get("editing_channel")
-        if not channel_row_id:
-            await message.reply_text("❌ Channel edit session expired.")
-            return True
-        parts = [x.strip() for x in (message.text or "").split("|")]
-        try:
-            if len(parts) >= 7:
-                title, channel_id, username, invite_link, join_text, style, position_raw = parts[:7]
-                config = validate_channel_input(title, channel_id, username, invite_link, join_text, style.lower())
-                position = safe_int(position_raw, -1)
-                if position < 0:
-                    raise ValueError("Position must be a non-negative integer.")
-            elif len(parts) >= 5:
-                title, channel_id, join_url, join_text, style = parts[:5]
-                username = normalize_username(join_url)
-                invite_link = join_url if re.match(r"^https?://t\.me/(?:\+|joinchat/)", join_url, re.I) else None
-                config = validate_channel_input(title, channel_id, username, invite_link, join_text, style.lower())
-                row = db_one("SELECT position FROM channels WHERE id=?", (channel_row_id,))
-                if not row:
-                    raise ValueError("Channel no longer exists.")
-                position = row["position"]
-            elif len(parts) >= 4:
-                title, channel_id, username, invite_link = parts[:4]
-                config = validate_channel_input(title, channel_id, username, invite_link)
-                row = db_one("SELECT position FROM channels WHERE id=?", (channel_row_id,))
-                if not row:
-                    raise ValueError("Channel no longer exists.")
-                position = row["position"]
-            else:
-                raise ValueError("Invalid format. Use Title | Channel ID | Join URL | Button Text | Style")
-            duplicate = db_one("SELECT id FROM channels WHERE id != ? AND (channel_id=? OR (username IS NOT NULL AND username=?) OR (invite_link IS NOT NULL AND invite_link=?))", (channel_row_id, config["channel_id"], config["username"], config["invite_link"]))
-            if duplicate:
-                await message.reply_text("❌ Channel already exists.")
-                return True
-            await validate_channel_with_telegram(context.bot, config)
-            with transaction():
-                DB.execute("UPDATE channels SET title=?, channel_id=?, username=?, invite_link=?, join_text=?, style=?, position=? WHERE id=?", (config["title"], config["channel_id"], config["username"], config["invite_link"], config["join_text"], config["style"], position, channel_row_id))
-            log_action(user_id, "edit_channel", str(channel_row_id))
-            context.user_data.clear()
-            await message.reply_text("✅ Channel updated.", reply_markup=admin_keyboard())
-        except ValueError as exc:
-            await message.reply_text(f"❌ CHANNEL VALIDATION FAILED\n\n{exc}")
-            return True
-        except sqlite3.Error:
-            logger.exception("Channel update failed")
-            await message.reply_text("❌ Channel could not be updated. Existing configuration was preserved.")
-            return True
         return True
 
     return False
@@ -6246,9 +6890,15 @@ async def general_message(
         update.effective_user.id
     )
 
-    register_user(
+    is_new_user = register_user(
         update.effective_user
     )
+
+    if is_new_user:
+        await notify_admin_new_user(
+            context,
+            update.effective_user,
+        )
 
     user = get_user(
         user_id
