@@ -795,6 +795,127 @@ def get_message(key):
 # PLACEHOLDERS
 # ============================================================
 
+
+def _utf16_len(value):
+    return len(value.encode("utf-16-le")) // 2
+
+
+def render_template_with_entities(text, entities, user_id=None, extra=None):
+    """Render placeholders while keeping Telegram UTF-16 entity offsets aligned."""
+    text = text or ""
+    entities = entities or []
+    extra = extra or {}
+
+    # Build the same values as render_template without formatting the text first.
+    user = get_user(user_id) if user_id else None
+    assigned_number = user["assigned_number"] if user else None
+    referrals = user["referrals"] if user else 0
+    earnings = 0.0
+    if user_id:
+        rows = db_all(
+            "SELECT reward FROM referrals WHERE referrer_id=?",
+            (user_id,),
+        )
+        earnings = sum(float(row["reward"] or 0) for row in rows)
+
+    values = {
+        "first_name": user["first_name"] if user else "",
+        "last_name": user["last_name"] if user else "",
+        "username": f"@{user['username']}" if user and user["username"] else "",
+        "user_id": user_id or "",
+        "referrals": referrals,
+        "agent_number": assigned_number or "—",
+        "total_users": db_one("SELECT COUNT(*) AS c FROM users")["c"],
+        "total_verified": db_one("SELECT COUNT(*) AS c FROM users WHERE verified=1")["c"],
+        "total_claims": db_one("SELECT COUNT(*) AS c FROM claims")["c"],
+        "available_numbers": db_one("SELECT COUNT(*) AS c FROM numbers WHERE active=1 AND assigned_user_id IS NULL")["c"],
+        "assigned_numbers": db_one("SELECT COUNT(*) AS c FROM numbers WHERE assigned_user_id IS NOT NULL")["c"],
+        "bot_name": get_setting("bot_name", "Agent Bot"),
+        "referral_link": extra.get("referral_link", ""),
+        "support": get_setting("support_url", ""),
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "join_date": user["join_date"] if user else "",
+        "claim_date": user["claim_date"] if user and user["claim_date"] else "",
+        "status": (
+            "Claimed" if user and user["assigned_number"] else
+            ("Verified" if user and user["verified"] else "Unverified")
+        ),
+        "minimum_referrals": get_setting("minimum_referrals", "0"),
+        "earnings": earnings,
+    }
+    values.update(extra)
+
+    class SafeDict(dict):
+        def __missing__(self, key):
+            return "{" + key + "}"
+
+    rendered_parts = []
+    boundary = [0] * (len(text) + 1)  # Python-character boundary -> rendered UTF-16 boundary
+    old_pos = 0
+    new_u16 = 0
+
+    for match in re.finditer(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", text):
+        start, end = match.span()
+        literal = text[old_pos:start]
+        rendered_parts.append(literal)
+        for idx in range(old_pos, start):
+            boundary[idx] = new_u16
+            new_u16 += _utf16_len(text[idx])
+        # new_u16 is now the rendered boundary immediately before the placeholder.
+        boundary[start] = new_u16
+
+        key = match.group(1)
+        replacement = str(values.get(key, match.group(0)))
+        rendered_parts.append(replacement)
+        replacement_u16 = _utf16_len(replacement)
+        boundary[end] = new_u16 + replacement_u16
+        # Boundaries inside the placeholder are mapped to its rendered start.
+        for idx in range(start + 1, end):
+            boundary[idx] = new_u16
+        new_u16 += replacement_u16
+        old_pos = end
+
+    tail = text[old_pos:]
+    rendered_parts.append(tail)
+    for idx in range(old_pos, len(text)):
+        boundary[idx] = new_u16
+        new_u16 += _utf16_len(text[idx])
+    boundary[len(text)] = new_u16
+
+    rendered = "".join(rendered_parts)
+
+    # Convert Python character boundaries back to Telegram UTF-16 offsets.
+    def py_index_from_u16(target):
+        total = 0
+        for idx, ch in enumerate(text):
+            if total >= target:
+                return idx
+            total += _utf16_len(ch)
+            if total >= target:
+                return idx + 1
+        return len(text)
+
+    adjusted = []
+    for entity in entities:
+        try:
+            data = entity.to_dict()
+            old_start_u16 = int(data.get("offset", 0))
+            old_len_u16 = int(data.get("length", 0))
+            old_end_u16 = old_start_u16 + old_len_u16
+            start_py = py_index_from_u16(old_start_u16)
+            end_py = py_index_from_u16(old_end_u16)
+            new_start = boundary[max(0, min(len(text), start_py))]
+            new_end = boundary[max(0, min(len(text), end_py))]
+            data["offset"] = new_start
+            data["length"] = max(0, new_end - new_start)
+            adjusted.append(MessageEntity.de_json(data, None))
+        except Exception:
+            logger.exception("Failed to adjust message entity")
+            adjusted.append(entity)
+
+    return rendered, adjusted
+
 def render_template(text, user_id=None, extra=None):
     extra = extra or {}
 
@@ -1086,6 +1207,95 @@ def keyboard_from_scope(scope):
 # CHANNEL SYSTEM
 # ============================================================
 
+VALID_BUTTON_ACTIONS = {"URL", "CALLBACK"}
+
+
+def normalize_username(value):
+    value = (value or "").strip()
+    if not value:
+        return None
+    if value.startswith(("https://t.me/", "http://t.me/")):
+        parsed = urllib.parse.urlparse(value)
+        path = parsed.path.strip("/")
+        if path.startswith("+") or path.startswith("joinchat/"):
+            return None
+        if path:
+            return "@" + path.split("/")[0].lstrip("@")
+    if value.startswith("@"):
+        return "@" + value[1:].strip()
+    if re.fullmatch(r"[A-Za-z0-9_]{5,32}", value):
+        return "@" + value
+    return None
+
+
+def normalize_join_url(username=None, invite_link=None):
+    invite_link = (invite_link or "").strip()
+    if invite_link:
+        if not re.match(r"^https?://t\.me/(?:\+[^\s]+|joinchat/[^\s]+)$", invite_link, re.I):
+            raise ValueError("Invalid Telegram invite URL.")
+        return invite_link
+    normalized = normalize_username(username)
+    if normalized:
+        return f"https://t.me/{normalized.lstrip('@')}"
+    return None
+
+
+def validate_channel_input(title, channel_id, username=None, invite_link=None, join_text="JOIN", style=None):
+    title = (title or "").strip()
+    channel_id = (channel_id or "").strip()
+    username = (username or "").strip() or None
+    invite_link = (invite_link or "").strip() or None
+    join_text = (join_text or "JOIN").strip()
+    if not title:
+        raise ValueError("Channel title is required.")
+    if not re.fullmatch(r"-100\d{5,15}|-\d{4,20}", channel_id):
+        raise ValueError("Invalid Channel ID. Example: -1001234567890")
+    if style and style not in VALID_STYLES:
+        raise ValueError("Invalid style. Allowed: primary, success, danger")
+    if not join_text:
+        raise ValueError("Join button text cannot be empty.")
+    normalized_username = normalize_username(username) if username else None
+    if username and not normalized_username:
+        raise ValueError("Invalid username. Use @username, username, or https://t.me/username")
+    if invite_link:
+        normalize_join_url(None, invite_link)
+    if not normalized_username and not invite_link:
+        raise ValueError("A public username or private invite URL is required.")
+    return {"title": title, "channel_id": channel_id, "username": normalized_username, "invite_link": invite_link, "join_text": join_text, "style": style or None}
+
+
+async def validate_channel_with_telegram(bot, config):
+    try:
+        chat = await bot.get_chat(config["channel_id"])
+    except TelegramError as first_exc:
+        if config.get("username"):
+            try:
+                chat = await bot.get_chat(config["username"])
+            except TelegramError as second_exc:
+                raise ValueError(f"Channel not found or inaccessible: {second_exc}") from second_exc
+        else:
+            raise ValueError(f"Channel not found or inaccessible: {first_exc}") from first_exc
+    if getattr(chat, "type", None) not in {"channel", "supergroup"}:
+        raise ValueError("The supplied ID is not a Telegram channel/supergroup.")
+    try:
+        me = await bot.get_me()
+        bot_member = await bot.get_chat_member(chat.id, me.id)
+    except TelegramError as exc:
+        raise ValueError(f"Bot cannot verify membership in this channel: {exc}") from exc
+    if getattr(bot_member, "status", None) not in {"administrator", "creator"}:
+        raise ValueError("Bot must be an administrator in the channel to perform membership checks.")
+    return chat
+
+
+def channel_join_url(channel):
+    if channel["invite_link"]:
+        return channel["invite_link"]
+    normalized = normalize_username(channel["username"])
+    if normalized:
+        return f"https://t.me/{normalized.lstrip('@')}"
+    return None
+
+
 def required_channels():
     return db_all(
         """
@@ -1099,87 +1309,32 @@ def required_channels():
 
 def channel_keyboard():
     rows = []
-
     for channel in required_channels():
-
-        url = (
-            channel["invite_link"]
-            or (
-                f"https://t.me/"
-                f"{channel['username'].lstrip('@')}"
-                if channel["username"]
-                else None
-            )
-        )
-
+        url = channel_join_url(channel)
         if url:
-            rows.append(
-                [
-                    create_button(
-                        channel["join_text"],
-                        "URL",
-                        url=url,
-                        style=channel["style"],
-                    )
-                ]
-            )
-
-    custom_start_buttons = keyboard_from_scope(
-        "start"
-    )
-
-    rows.extend(
-        custom_start_buttons
-    )
-
-    rows.append(
-        [
-            create_button(
-                "✅ VERIFY",
-                "CALLBACK",
-                callback="verify",
-                style="success",
-            )
-        ]
-    )
-
-    return InlineKeyboardMarkup(
-        rows
-    )
+            rows.append([create_button(channel["join_text"], "URL", url=url, style=normalize_style(channel["style"]))])
+        else:
+            logger.error("Enabled channel %s has no usable join URL", channel["id"])
+            rows.append([create_button("⚠️ Channel unavailable", "CALLBACK", callback=f"channel_config_error:{channel['id']}", style="danger")])
+    rows.extend(keyboard_from_scope("start"))
+    rows.append([create_button("✅ VERIFY", "CALLBACK", callback="verify", style="success")])
+    return InlineKeyboardMarkup(rows)
 
 
-async def check_channel_membership(
-    bot,
-    user_id,
-):
+async def check_channel_membership(bot, user_id):
     missing = []
     errors = []
-
     for channel in required_channels():
-
         try:
-
-            member = await bot.get_chat_member(
-                chat_id=channel["channel_id"],
-                user_id=user_id,
-            )
-
-            if member.status in (
-                "left",
-                "kicked",
-            ):
-                missing.append(
-                    channel
-                )
-
-        except TelegramError as exc:
-            errors.append(
-                (
-                    channel,
-                    str(exc),
-                )
-            )
-
+            member = await bot.get_chat_member(chat_id=channel["channel_id"], user_id=user_id)
+            status = getattr(member, "status", "")
+            is_member = getattr(member, "is_member", None)
+            if status in {"left", "kicked"} or (status == "restricted" and is_member is False):
+                missing.append(channel)
+        except RetryAfter as exc:
+            errors.append((channel, f"RetryAfter: {exc.retry_after}"))
+        except (Forbidden, BadRequest, NetworkError, TimedOut, TelegramError) as exc:
+            errors.append((channel, str(exc)))
     return missing, errors
 
 
@@ -1331,15 +1486,15 @@ async def send_configured_message(
         key
     )
 
-    text = render_template(
-        message["text"],
-        chat_id,
-        extra,
-    )
-
-    entities = deserialize_entities(
+    stored_entities = deserialize_entities(
         message["entities"],
         context.bot,
+    )
+    text, entities = render_template_with_entities(
+        message["text"],
+        stored_entities,
+        chat_id,
+        extra,
     )
 
     media_type = message[
@@ -1562,6 +1717,8 @@ async def verify_callback(
     )
 
     if missing or errors:
+        DB.execute("UPDATE users SET verified=0, last_activity=? WHERE id=?", (utc_now(), user_id))
+        DB.commit()
 
         names = "\n".join(
             f"• {channel['title']}"
@@ -2054,6 +2211,10 @@ async def admin_callback_router(
 
     data = query.data or ""
 
+    # Navigation callbacks must cancel stale admin input states.
+    if not data.startswith("adm:confirm_broadcast:") and data != "adm:cancel_broadcast":
+        context.user_data.clear()
+
     try:
 
         if data == "adm:dash":
@@ -2139,6 +2300,30 @@ async def admin_callback_router(
                 update,
                 context,
             )
+
+        elif data.startswith("adm:editbtn:"):
+            await admin_edit_button_flow(update, context, safe_int(data.split(":")[-1], 0))
+
+        elif data.startswith("adm:editchannel:"):
+            await admin_edit_channel_flow(update, context, safe_int(data.split(":")[-1], 0))
+
+        elif data.startswith("adm:delch:"):
+            channel_id = safe_int(data.split(":")[-1], 0)
+            channel = db_one("SELECT * FROM channels WHERE id=?", (channel_id,))
+            if not channel:
+                await admin_channels(update, context, 0)
+            else:
+                await edit_admin_message(update, f"⚠️ DELETE CHANNEL?\n\nChannel: {channel['title']}\n\nAre you sure?", InlineKeyboardMarkup([[create_button("❌ DELETE", "CALLBACK", callback=f"adm:confirmdelch:{channel_id}", style="danger"), create_button("↩️ CANCEL", "CALLBACK", callback="adm:channels:0")]]))
+
+        elif data.startswith("adm:confirmdelch:"):
+            channel_id = safe_int(data.split(":")[-1], 0)
+            with transaction():
+                DB.execute("DELETE FROM channels WHERE id=?", (channel_id,))
+            log_action(user_id, "delete_channel", str(channel_id))
+            await admin_channels(update, context, 0)
+
+        elif data == "adm:channel_health":
+            await admin_channel_health(update, context)
 
         elif data.startswith(
             "adm:msgedit:"
@@ -2497,6 +2682,10 @@ async def admin_callback_router(
                 )[2],
             )
 
+        elif data == "adm:cancel":
+            context.user_data.clear()
+            await edit_admin_message(update, "❌ Cancelled.", admin_keyboard())
+
         elif data.startswith(
             "adm:confirm_broadcast:"
         ):
@@ -2520,8 +2709,7 @@ async def admin_callback_router(
 
         try:
             await query.message.reply_text(
-                "⚠️ Admin action failed safely.\n\n"
-                + str(exc)[:500]
+                "⚠️ Admin action failed safely. Check the bot logs for details."
             )
         except TelegramError:
             pass
@@ -2965,6 +3153,19 @@ async def admin_channels(
             rows
         ),
     )
+
+
+async def admin_channel_health(update, context):
+    channels = db_all("SELECT * FROM channels ORDER BY position, id")
+    lines = ["🩺 CHANNEL HEALTH\n"]
+    for channel in channels:
+        try:
+            config = {"channel_id": channel["channel_id"], "username": channel["username"]}
+            await validate_channel_with_telegram(context.bot, config)
+            lines.append(f"✅ {channel['title']} — Working")
+        except Exception as exc:
+            lines.append(f"❌ {channel['title']} — {str(exc)[:180]}")
+    await edit_admin_message(update, "\n".join(lines), InlineKeyboardMarkup([[create_button("⬅️ Channels", "CALLBACK", callback="adm:channels:0")]]))
 
 
 # ============================================================
@@ -5399,135 +5600,84 @@ async def handle_admin_message(
 
         # Channel
         elif kind == "channel":
+            parts = [item.strip() for item in text.split("|")]
+            try:
+                if len(parts) >= 5:
+                    title, channel_id, join_url, join_text, style = parts[:5]
+                    username = normalize_username(join_url)
+                    invite_link = join_url if re.match(r"^https?://t\.me/(?:\+|joinchat/)", join_url, re.I) else None
+                    config = validate_channel_input(title, channel_id, username, invite_link, join_text, style.lower())
+                elif len(parts) >= 4:
+                    title, channel_id, username, invite_link = parts[:4]
+                    config = validate_channel_input(title, channel_id, username, invite_link)
+                elif len(parts) >= 3:
+                    title, channel_id, join_url = parts[:3]
+                    username = normalize_username(join_url)
+                    invite_link = join_url if re.match(r"^https?://t\.me/(?:\+|joinchat/)", join_url, re.I) else None
+                    config = validate_channel_input(title, channel_id, username, invite_link)
+                else:
+                    raise ValueError("Invalid format.")
 
-            parts = [
-                item.strip()
-                for item in text.split("|")
-            ]
-
-            if len(parts) < 2:
-                await message.reply_text(
-                    "❌ Invalid format.\n\n"
-                    "Title | Channel ID | @username | invite URL"
+                duplicate = db_one(
+                    "SELECT id FROM channels WHERE channel_id=? OR (username IS NOT NULL AND username=? ) OR (invite_link IS NOT NULL AND invite_link=?)",
+                    (config["channel_id"], config["username"], config["invite_link"]),
                 )
+                if duplicate:
+                    await message.reply_text("❌ Channel already exists.")
+                    return True
+
+                await validate_channel_with_telegram(context.bot, config)
+
+                position = db_one("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM channels")["p"]
+                with transaction():
+                    DB.execute(
+                        """INSERT INTO channels(title, channel_id, username, invite_link, join_text, style, position) VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                        (config["title"], config["channel_id"], config["username"], config["invite_link"], config["join_text"], config["style"], position),
+                    )
+                log_action(user_id, "add_channel", config["channel_id"])
+                await message.reply_text("✅ Channel added.", reply_markup=admin_keyboard())
+            except ValueError as exc:
+                await message.reply_text(f"❌ CHANNEL VALIDATION FAILED\n\n{exc}")
                 return True
-
-            title = parts[0]
-            channel_id = parts[1]
-
-            username = (
-                parts[2]
-                if len(parts) > 2
-                and parts[2]
-                else None
-            )
-
-            invite_link = (
-                parts[3]
-                if len(parts) > 3
-                and parts[3]
-                else None
-            )
-
-            position = db_one(
-                """
-                SELECT
-                    COALESCE(
-                        MAX(position),
-                        -1
-                    ) + 1 AS p
-                FROM channels
-                """
-            )["p"]
-
-            DB.execute(
-                """
-                INSERT INTO channels
-                (
-                    title,
-                    channel_id,
-                    username,
-                    invite_link,
-                    position
-                )
-                VALUES(?, ?, ?, ?, ?)
-                """,
-                (
-                    title,
-                    channel_id,
-                    username,
-                    invite_link,
-                    position,
-                ),
-            )
-
-            DB.commit()
-
-            await message.reply_text(
-                "✅ Channel added."
-            )
+            except sqlite3.Error:
+                logger.exception("Channel insert failed")
+                await message.reply_text("❌ Channel could not be saved. No partial data was stored.")
+                return True
 
         # Button
         elif kind == "button":
-
-            parts = text.split("|")
-
+            parts = [x.strip() for x in text.split("|")]
             if len(parts) < 8:
-                await message.reply_text(
-                    "❌ Invalid button format.\n\n"
-                    "TEXT|SCOPE|ACTION|URL|CALLBACK|STYLE|ROW|POSITION"
-                )
+                await message.reply_text("❌ Invalid button format.\n\nTEXT|SCOPE|ACTION|URL|CALLBACK|STYLE|ROW|POSITION")
                 return True
-
-            button_text = parts[0]
-            scope = parts[1]
-            action = parts[2]
-            url = parts[3] or None
-            callback = parts[4] or None
-            style = (
-                parts[5]
-                if parts[5] in VALID_STYLES
-                else None
-            )
-            row = safe_int(
-                parts[6]
-            )
-            position = safe_int(
-                parts[7]
-            )
-
-            DB.execute(
-                """
-                INSERT INTO buttons
-                (
-                    scope,
-                    text,
-                    action,
-                    url,
-                    callback,
-                    style,
-                    row,
-                    position
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    scope,
-                    button_text,
-                    action,
-                    url,
-                    callback,
-                    style,
-                    row,
-                    position,
-                ),
-            )
-
-            DB.commit()
-
-            await message.reply_text(
-                "✅ Button added."
-            )
+            button_text, scope, action = parts[0], parts[1], parts[2].upper()
+            url, callback, style = parts[3] or None, parts[4] or None, parts[5].lower() or None
+            row, position = safe_int(parts[6], -1), safe_int(parts[7], -1)
+            if not button_text or not scope or action not in VALID_BUTTON_ACTIONS:
+                await message.reply_text("❌ Invalid button TEXT, SCOPE or ACTION.")
+                return True
+            if style and style not in VALID_STYLES:
+                await message.reply_text("❌ Invalid style. Allowed: primary, success, danger")
+                return True
+            if row < 0 or position < 0:
+                await message.reply_text("❌ ROW and POSITION must be non-negative integers.")
+                return True
+            if action == "URL":
+                if not url or not re.match(r"^https?://[^\s]+$", url, re.I):
+                    await message.reply_text("❌ URL button requires a valid http(s) URL.")
+                    return True
+                callback = None
+            else:
+                if not callback or not (1 <= len(callback.encode("utf-8")) <= 64):
+                    await message.reply_text("❌ Callback button requires callback data of 1-64 UTF-8 bytes.")
+                    return True
+                url = None
+                if db_one("SELECT id FROM buttons WHERE callback=?", (callback,)):
+                    await message.reply_text("❌ Callback identifier already exists.")
+                    return True
+            with transaction():
+                DB.execute("INSERT INTO buttons(scope, text, action, url, callback, style, row, position) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", (scope, button_text, action, url, callback, style, row, position))
+            await message.reply_text("✅ Button added.", reply_markup=admin_keyboard())
 
         # Admin
         elif kind == "admin":
@@ -5570,18 +5720,14 @@ async def handle_admin_message(
 
             if message.photo:
 
-                caption = (
-                    message.caption
-                    or get_message(
-                        "start"
-                    )["text"]
-                )
+                current_start = get_message("start")
+                caption = message.caption or current_start["text"]
+                caption_entities = message.caption_entities or (deserialize_entities(current_start["entities"], context.bot) if not message.caption else [])
 
                 save_message(
                     "start",
                     caption,
-                    message.caption_entities
-                    or [],
+                    caption_entities,
                     "photo",
                     message.photo[-1].file_id,
                 )
@@ -5594,18 +5740,14 @@ async def handle_admin_message(
 
             elif message.video:
 
-                caption = (
-                    message.caption
-                    or get_message(
-                        "start"
-                    )["text"]
-                )
+                current_start = get_message("start")
+                caption = message.caption or current_start["text"]
+                caption_entities = message.caption_entities or (deserialize_entities(current_start["entities"], context.bot) if not message.caption else [])
 
                 save_message(
                     "start",
                     caption,
-                    message.caption_entities
-                    or [],
+                    caption_entities,
                     "video",
                     message.video.file_id,
                 )
@@ -5825,119 +5967,91 @@ async def handle_extended_admin_state(
     message = update.message
 
     if state == "edit_button":
-
-        button_id = context.user_data.get(
-            "editing_button"
-        )
-
-        parts = (
-            message.text or ""
-        ).split("|")
-
+        button_id = context.user_data.get("editing_button")
+        parts = (message.text or "").split("|")
         if len(parts) < 8:
-            await message.reply_text(
-                "❌ Invalid format."
-            )
+            await message.reply_text("❌ Invalid button format. Use TEXT|SCOPE|ACTION|URL|CALLBACK|STYLE|ROW|POSITION")
             return True
-
-        DB.execute(
-            """
-            UPDATE buttons
-            SET text=?,
-                scope=?,
-                action=?,
-                url=?,
-                callback=?,
-                style=?,
-                row=?,
-                position=?
-            WHERE id=?
-            """,
-            (
-                parts[0],
-                parts[1],
-                parts[2],
-                parts[3] or None,
-                parts[4] or None,
-                (
-                    parts[5]
-                    if parts[5]
-                    in VALID_STYLES
-                    else None
-                ),
-                safe_int(parts[6]),
-                safe_int(parts[7]),
-                button_id,
-            ),
-        )
-
+        text_value, scope, action = parts[0].strip(), parts[1].strip(), parts[2].strip().upper()
+        url, callback, style = parts[3].strip() or None, parts[4].strip() or None, parts[5].strip().lower() or None
+        row, position = safe_int(parts[6], -1), safe_int(parts[7], -1)
+        if not button_id or not text_value or not scope or action not in VALID_BUTTON_ACTIONS:
+            await message.reply_text("❌ Invalid TEXT, SCOPE or ACTION.")
+            return True
+        if style and style not in VALID_STYLES:
+            await message.reply_text("❌ Invalid style. Allowed: primary, success, danger")
+            return True
+        if row < 0 or position < 0:
+            await message.reply_text("❌ ROW and POSITION must be non-negative integers.")
+            return True
+        if action == "URL":
+            if not url or not re.match(r"^https?://[^\s]+$", url, re.I):
+                await message.reply_text("❌ URL button requires a valid http(s) URL.")
+                return True
+            callback = None
+        else:
+            if not callback or not (1 <= len(callback.encode("utf-8")) <= 64):
+                await message.reply_text("❌ Callback button requires callback data of 1-64 UTF-8 bytes.")
+                return True
+            url = None
+            duplicate = db_one("SELECT id FROM buttons WHERE callback=? AND id != ?", (callback, button_id))
+            if duplicate:
+                await message.reply_text("❌ Callback identifier already exists.")
+                return True
+        DB.execute("UPDATE buttons SET text=?, scope=?, action=?, url=?, callback=?, style=?, row=?, position=? WHERE id=?", (text_value, scope, action, url, callback, style, row, position, button_id))
         DB.commit()
-
         context.user_data.clear()
-
-        await message.reply_text(
-            "✅ Button updated.",
-            reply_markup=admin_keyboard(),
-        )
-
+        await message.reply_text("✅ Button updated.", reply_markup=admin_keyboard())
         return True
 
     if state == "edit_channel":
-
-        channel_id = context.user_data.get(
-            "editing_channel"
-        )
-
-        parts = [
-            x.strip()
-            for x in (
-                message.text or ""
-            ).split("|")
-        ]
-
-        if len(parts) < 2:
-            await message.reply_text(
-                "❌ Invalid format."
-            )
+        channel_row_id = context.user_data.get("editing_channel")
+        if not channel_row_id:
+            await message.reply_text("❌ Channel edit session expired.")
             return True
-
-        DB.execute(
-            """
-            UPDATE channels
-            SET title=?,
-                channel_id=?,
-                username=?,
-                invite_link=?
-            WHERE id=?
-            """,
-            (
-                parts[0],
-                parts[1],
-                (
-                    parts[2]
-                    if len(parts) > 2
-                    and parts[2]
-                    else None
-                ),
-                (
-                    parts[3]
-                    if len(parts) > 3
-                    and parts[3]
-                    else None
-                ),
-                channel_id,
-            ),
-        )
-
-        DB.commit()
-
-        context.user_data.clear()
-
-        await message.reply_text(
-            "✅ Channel updated.",
-            reply_markup=admin_keyboard(),
-        )
-
+        parts = [x.strip() for x in (message.text or "").split("|")]
+        try:
+            if len(parts) >= 7:
+                title, channel_id, username, invite_link, join_text, style, position_raw = parts[:7]
+                config = validate_channel_input(title, channel_id, username, invite_link, join_text, style.lower())
+                position = safe_int(position_raw, -1)
+                if position < 0:
+                    raise ValueError("Position must be a non-negative integer.")
+            elif len(parts) >= 5:
+                title, channel_id, join_url, join_text, style = parts[:5]
+                username = normalize_username(join_url)
+                invite_link = join_url if re.match(r"^https?://t\.me/(?:\+|joinchat/)", join_url, re.I) else None
+                config = validate_channel_input(title, channel_id, username, invite_link, join_text, style.lower())
+                row = db_one("SELECT position FROM channels WHERE id=?", (channel_row_id,))
+                if not row:
+                    raise ValueError("Channel no longer exists.")
+                position = row["position"]
+            elif len(parts) >= 4:
+                title, channel_id, username, invite_link = parts[:4]
+                config = validate_channel_input(title, channel_id, username, invite_link)
+                row = db_one("SELECT position FROM channels WHERE id=?", (channel_row_id,))
+                if not row:
+                    raise ValueError("Channel no longer exists.")
+                position = row["position"]
+            else:
+                raise ValueError("Invalid format. Use Title | Channel ID | Join URL | Button Text | Style")
+            duplicate = db_one("SELECT id FROM channels WHERE id != ? AND (channel_id=? OR (username IS NOT NULL AND username=?) OR (invite_link IS NOT NULL AND invite_link=?))", (channel_row_id, config["channel_id"], config["username"], config["invite_link"]))
+            if duplicate:
+                await message.reply_text("❌ Channel already exists.")
+                return True
+            await validate_channel_with_telegram(context.bot, config)
+            with transaction():
+                DB.execute("UPDATE channels SET title=?, channel_id=?, username=?, invite_link=?, join_text=?, style=?, position=? WHERE id=?", (config["title"], config["channel_id"], config["username"], config["invite_link"], config["join_text"], config["style"], position, channel_row_id))
+            log_action(user_id, "edit_channel", str(channel_row_id))
+            context.user_data.clear()
+            await message.reply_text("✅ Channel updated.", reply_markup=admin_keyboard())
+        except ValueError as exc:
+            await message.reply_text(f"❌ CHANNEL VALIDATION FAILED\n\n{exc}")
+            return True
+        except sqlite3.Error:
+            logger.exception("Channel update failed")
+            await message.reply_text("❌ Channel could not be updated. Existing configuration was preserved.")
+            return True
         return True
 
     return False
@@ -5987,6 +6101,9 @@ async def custom_callback_router(
     )
 
     if callback_data == "noop":
+        return
+    if callback_data.startswith("channel_config_error:"):
+        await answer_callback(query, "This required channel is misconfigured. Please contact the bot administrator.", True)
         return
 
     button = db_one(
